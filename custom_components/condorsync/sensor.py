@@ -58,6 +58,7 @@ class CondorSyncStatusSensor(CoordinatorEntity, SensorEntity):
         device = coordinator.data[device_id]
         self._attr_name = f"{device.get('name')} Status"
         self._attr_unique_id = f"{device_id}_status"
+        self._attr_icon = "mdi:signal"
 
     @property
     def native_value(self) -> str:
@@ -109,6 +110,9 @@ class CondorSyncGenericSensor(CoordinatorEntity, SensorEntity):
         self._attr_name = f"{device.get('name')} {display_name}"
         self._attr_unique_id = f"{device_id}_{def_type}_{tech_name}"
         self._attr_native_unit_of_measurement = definition.get("unit")
+        
+        # Default icon
+        self._attr_icon = "mdi:gauge"
         
         # Map data types to device classes if applicable
         data_type = definition.get("data_type")
