@@ -64,7 +64,7 @@ class CondorSyncStatusSensor(CoordinatorEntity, SensorEntity):
         self._attr_unique_id = f"{device_id}_status"
         
         # Determine icon based on device type icon field
-        backend_icon = self._dt_metadata.get("icon", "").lower()
+        backend_icon = (self._dt_metadata.get("icon") or "").lower()
         if "pump" in backend_icon:
             self._attr_icon = "mdi:water-pump"
         elif "fan" in backend_icon:
