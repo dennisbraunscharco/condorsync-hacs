@@ -92,7 +92,8 @@ class CondorSyncAPI:
                         devices = data.get("devices", [])
                         all_devices.extend(devices)
                         
-                        total_pages = data.get("total_pages", 0)
+                        pagination = data.get("pagination", {})
+                        total_pages = pagination.get("total_pages", 0)
                         if page >= total_pages or not devices:
                             break
                         page += 1
@@ -110,6 +111,42 @@ class CondorSyncAPI:
                 break
                 
         return all_devices
+
+    async def get_device_detail(self, device_id: str) -> Dict[str, Any]:
+        """Get full device information including parameters."""
+        if not self._token:
+            if not await self.authenticate():
+                return {}
+
+        url = f"{self._api_url}/devices/{device_id}"
+        headers = {"Authorization": f"Bearer {self._token}"}
+        
+        try:
+            async with self._session.get(url, headers=headers) as response:
+                if response.status == 200:
+                    return await response.json()
+                return {}
+        except Exception as err:
+            _LOGGER.exception("Error fetching device detail for %s: %s", device_id, err)
+            return {}
+
+    async def get_device_type(self, device_type_id: int) -> Dict[str, Any]:
+        """Get device type definition."""
+        if not self._token:
+            if not await self.authenticate():
+                return {}
+
+        url = f"{self._api_url}/device_types/{device_type_id}"
+        headers = {"Authorization": f"Bearer {self._token}"}
+        
+        try:
+            async with self._session.get(url, headers=headers) as response:
+                if response.status == 200:
+                    return await response.json()
+                return {}
+        except Exception as err:
+            _LOGGER.exception("Error fetching device type %s: %s", device_type_id, err)
+            return {}
 
     async def close(self) -> None:
         """Close the session."""

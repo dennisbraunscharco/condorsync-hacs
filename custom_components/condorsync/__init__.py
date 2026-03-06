@@ -34,15 +34,34 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         if not devices:
             devices = await api.get_devices()
             
-        # Create a dict of devices keyed by uniqueId for easy access
-        # Fallback to 'id' or 'device_id' if 'uniqueId' is missing
+        # Create a dict of devices keyed by uniqueId
+        import asyncio
         result = {}
-        for device in devices:
+        
+        # We need to fetch details for EACH device because the list doesn't include parameter_json
+        # To avoid overloading the server, we fetch them in smaller batches
+        semaphore = asyncio.Semaphore(10)
+        
+        async def fetch_detail(device):
             uid = device.get("uniqueId") or device.get("id") or device.get("device_id")
-            if uid:
+            if not uid:
+                return
+            
+            async with semaphore:
+                detail = await api.get_device_detail(uid)
+                if detail:
+                    # Merge detail into device
+                    device.update(detail)
+                    # Handle the case where the detail endpoint might return 'parameters' instead of 'parameter_json'
+                    if "parameters" in detail and "parameter_json" not in device:
+                        import json
+                        device["parameter_json"] = json.dumps(detail["parameters"])
+                
                 result[uid] = device
-            else:
-                _LOGGER.warning("Found device without identifier: %s", device)
+
+        if devices:
+            await asyncio.gather(*(fetch_detail(d) for d in devices))
+            
         return result
 
     coordinator = DataUpdateCoordinator(
@@ -55,27 +74,35 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     await coordinator.async_config_entry_first_refresh()
 
-    # Fetch definitions for each device type
+    # Fetch definitions and device types for each device type id
     definitions = {}
-    device_types = set()
+    device_type_data = {}
+    device_type_ids = set()
     for device in coordinator.data.values():
         dt_id = device.get("device_type_id")
         if dt_id:
-            device_types.add(dt_id)
+            device_type_ids.add(dt_id)
     
-    for dt_id in device_types:
+    for dt_id in device_type_ids:
+        # Fetch sensor/parameter definitions
         sensors = await api.get_sensor_definitions(dt_id)
         parameters = await api.get_parameter_definitions(dt_id)
         definitions[dt_id] = {
             "sensors": sensors,
             "parameters": parameters,
         }
+        
+        # Fetch device type metadata (for icons)
+        dt_response = await api.get_device_type(dt_id)
+        if dt_response:
+            device_type_data[dt_id] = dt_response
 
     hass.data.setdefault(DOMAIN, {})
     hass.data[DOMAIN][entry.entry_id] = {
         "api": api,
         "coordinator": coordinator,
         "definitions": definitions,
+        "device_types": device_type_data,
     }
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)

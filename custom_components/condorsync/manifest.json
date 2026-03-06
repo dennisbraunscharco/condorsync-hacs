@@ -7,9 +7,9 @@
     ],
     "dependencies": [],
     "codeowners": [
-        "@condorsync"
+        "@Condor Elektronik Scharco GmbH"
     ],
     "config_flow": true,
     "iot_class": "cloud_polling",
-    "version": "1.1.5"
+    "version": "1.1.7"
 }
