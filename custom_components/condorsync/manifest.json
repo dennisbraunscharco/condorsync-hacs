@@ -1,0 +1,15 @@
+{
+    "domain": "condorsync",
+    "name": "CondorSync",
+    "documentation": "https://github.com/dennisbraunscharco/condorsync-hacs",
+    "requirements": [
+        "aiohttp"
+    ],
+    "dependencies": [],
+    "codeowners": [
+        "@condorsync"
+    ],
+    "config_flow": true,
+    "iot_class": "cloud_polling",
+    "version": "1.0.0"
+}
