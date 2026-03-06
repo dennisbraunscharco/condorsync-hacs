@@ -33,6 +33,44 @@ class CondorSyncAPI:
             _LOGGER.exception("Error during authentication: %s", err)
             return False
 
+    async def get_sensor_definitions(self, device_type_id: int) -> List[Dict[str, Any]]:
+        """Get sensor definitions for a device type."""
+        if not self._token:
+            if not await self.authenticate():
+                return []
+
+        url = f"{self._api_url}/definitions/sensors?project_id={device_type_id}"
+        headers = {"Authorization": f"Bearer {self._token}"}
+        
+        try:
+            async with self._session.get(url, headers=headers) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    return data.get("data", [])
+                return []
+        except Exception as err:
+            _LOGGER.exception("Error fetching sensor definitions: %s", err)
+            return []
+
+    async def get_parameter_definitions(self, device_type_id: int) -> List[Dict[str, Any]]:
+        """Get parameter definitions for a device type."""
+        if not self._token:
+            if not await self.authenticate():
+                return []
+
+        url = f"{self._api_url}/definitions/parameters?project_id={device_type_id}"
+        headers = {"Authorization": f"Bearer {self._token}"}
+        
+        try:
+            async with self._session.get(url, headers=headers) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    return data.get("data", [])
+                return []
+        except Exception as err:
+            _LOGGER.exception("Error fetching parameter definitions: %s", err)
+            return []
+
     async def get_devices(self) -> List[Dict[str, Any]]:
         """Get the list of devices."""
         if not self._token:

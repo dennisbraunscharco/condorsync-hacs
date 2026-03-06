@@ -55,10 +55,27 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     await coordinator.async_config_entry_first_refresh()
 
+    # Fetch definitions for each device type
+    definitions = {}
+    device_types = set()
+    for device in coordinator.data.values():
+        dt_id = device.get("device_type_id")
+        if dt_id:
+            device_types.add(dt_id)
+    
+    for dt_id in device_types:
+        sensors = await api.get_sensor_definitions(dt_id)
+        parameters = await api.get_parameter_definitions(dt_id)
+        definitions[dt_id] = {
+            "sensors": sensors,
+            "parameters": parameters,
+        }
+
     hass.data.setdefault(DOMAIN, {})
     hass.data[DOMAIN][entry.entry_id] = {
         "api": api,
         "coordinator": coordinator,
+        "definitions": definitions,
     }
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
