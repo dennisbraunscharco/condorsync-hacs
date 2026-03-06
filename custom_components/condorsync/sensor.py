@@ -105,7 +105,26 @@ class CondorSyncGenericSensor(CoordinatorEntity, SensorEntity):
         
         device = coordinator.data[device_id]
         tech_name = definition.get("name")
-        display_name = definition.get("sensor_type") or definition.get("name")
+        
+        # Get localized name: English -> German -> sensor_type/name (fallback)
+        translations = definition.get("translations") or {}
+        name_translations = {}
+        if isinstance(translations, dict):
+            name_translations = translations.get("name") or {}
+        elif isinstance(translations, str):
+            try:
+                import json
+                parsed = json.loads(translations)
+                name_translations = parsed.get("name") or {}
+            except (json.JSONDecodeError, TypeError):
+                pass
+                
+        display_name = (
+            name_translations.get("en") 
+            or name_translations.get("de") 
+            or definition.get("sensor_type") 
+            or tech_name
+        )
         
         self._attr_name = f"{device.get('name')} {display_name}"
         self._attr_unique_id = f"{device_id}_{def_type}_{tech_name}"
