@@ -1,0 +1,10 @@
+{
+    "name": "CondorSync",
+    "content_in_root": false,
+    "zip_release": false,
+    "filename": "condorsync",
+    "render_readme": true,
+    "country": [
+        "DE"
+    ]
+}
