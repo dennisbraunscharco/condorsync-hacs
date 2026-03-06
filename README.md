@@ -1,3 +1,4 @@
+# <img src="brand/logo.png" width="300" alt="CondorSync Logo">
 # CondorSync Home Assistant Integration
 
 This custom integration allows you to view your CondorSync devices in Home Assistant.
