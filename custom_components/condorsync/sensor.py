@@ -57,8 +57,8 @@ class CondorSyncStatusSensor(CoordinatorEntity, SensorEntity):
             return {}
         
         return {
-            ATTR_DEVICE_TYPE: device.get("type"),
-            ATTR_LAST_SEEN: device.get("last_seen"),
+            ATTR_DEVICE_TYPE: device.get("type") or device.get("device_type"),
+            ATTR_LAST_SEEN: device.get("last_seen") or device.get("updated_at"),
         }
 
     @property

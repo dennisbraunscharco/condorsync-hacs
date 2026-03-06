@@ -35,7 +35,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             devices = await api.get_devices()
             
         # Create a dict of devices keyed by uniqueId for easy access
-        return {device["uniqueId"]: device for device in devices}
+        # Fallback to 'id' or 'device_id' if 'uniqueId' is missing
+        result = {}
+        for device in devices:
+            uid = device.get("uniqueId") or device.get("id") or device.get("device_id")
+            if uid:
+                result[uid] = device
+            else:
+                _LOGGER.warning("Found device without identifier: %s", device)
+        return result
 
     coordinator = DataUpdateCoordinator(
         hass,
