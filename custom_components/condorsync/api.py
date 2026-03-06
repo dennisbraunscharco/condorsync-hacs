@@ -72,34 +72,44 @@ class CondorSyncAPI:
             return []
 
     async def get_devices(self) -> List[Dict[str, Any]]:
-        """Get the list of devices."""
+        """Get the list of devices with pagination."""
         if not self._token:
             if not await self.authenticate():
                 return []
 
-        url = f"{self._api_url}/devices"
-        headers = {"Authorization": f"Bearer {self._token}"}
+        all_devices = []
+        page = 1
+        page_size = 100
         
-        try:
-            async with self._session.get(url, headers=headers) as response:
-                if response.status == 200:
-                    data = await response.json()
-                    return data.get("devices", [])
+        while True:
+            url = f"{self._api_url}/devices?page={page}&page_size={page_size}"
+            headers = {"Authorization": f"Bearer {self._token}"}
+            
+            try:
+                async with self._session.get(url, headers=headers) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        devices = data.get("devices", [])
+                        all_devices.extend(devices)
+                        
+                        total_pages = data.get("total_pages", 0)
+                        if page >= total_pages or not devices:
+                            break
+                        page += 1
+                        continue
+                        
+                    if response.status == 401:
+                        # Token expired? Try re-authenticating
+                        if await self.authenticate():
+                            continue
+                    
+                    _LOGGER.error("Failed to fetch devices at page %s: %s", page, response.status)
+                    break
+            except Exception as err:
+                _LOGGER.exception("Error fetching devices at page %s: %s", page, err)
+                break
                 
-                if response.status == 401:
-                    # Token expired? Try re-authenticating
-                    if await self.authenticate():
-                        headers["Authorization"] = f"Bearer {self._token}"
-                        async with self._session.get(url, headers=headers) as response:
-                            if response.status == 200:
-                                data = await response.json()
-                                return data.get("devices", [])
-                                
-                _LOGGER.error("Failed to fetch devices: %s", response.status)
-                return []
-        except Exception as err:
-            _LOGGER.exception("Error fetching devices: %s", err)
-            return []
+        return all_devices
 
     async def close(self) -> None:
         """Close the session."""
