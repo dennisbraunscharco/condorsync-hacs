@@ -17,6 +17,7 @@ from .const import (
     CONF_DEVICE_ID,
     CONF_ACCESS_TOKEN,
     CONF_REFRESH_TOKEN,
+    CONF_USER_LEVEL,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -34,6 +35,30 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         refresh_token=entry.data.get(CONF_REFRESH_TOKEN),
     )
 
+    # Register static brand assets for local serving across HA versions
+    try:
+        from pathlib import Path
+        brand_path = Path(__file__).parent / "brand"
+        if brand_path.exists() and hasattr(hass, "http"):
+            try:
+                from homeassistant.components.http import StaticPathConfig
+                await hass.http.async_register_static_paths([
+                    StaticPathConfig("/api/brands/integration/condorsync", str(brand_path), False)
+                ])
+            except (ImportError, AttributeError):
+                try:
+                    hass.http.register_static_path(
+                        "/api/brands/integration/condorsync", str(brand_path), cache_headers=False
+                    )
+                except Exception:
+                    pass
+    except Exception as brand_err:
+        _LOGGER.debug("Could not register local brand static path: %s", brand_err)
+
+    # Sync user permissions and level
+    await api.get_current_user()
+    user_level = api.user_level or entry.data.get(CONF_USER_LEVEL, 0)
+
     async def async_update_data():
         """Fetch data from API endpoint."""
         devices = await api.get_devices()
@@ -44,12 +69,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         if not devices:
             devices = await api.get_devices()
             
-        # Create a dict of devices keyed by uniqueId
         import asyncio
         result = {}
         
-        # We need to fetch details for EACH device because the list doesn't include parameter_json
-        # To avoid overloading the server, we fetch them in smaller batches
+        # Semaphore to avoid rate-limiting or overloading backend
         semaphore = asyncio.Semaphore(10)
         
         async def fetch_detail(device):
@@ -58,14 +81,21 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 return
             
             async with semaphore:
+                # 1. Fetch device detail (properties and parameters)
                 detail = await api.get_device_detail(uid)
                 if detail:
-                    # Merge detail into device
+                    if "properties" in detail and isinstance(detail["properties"], dict):
+                        device.update(detail["properties"])
+                    if "parameters" in detail and isinstance(detail["parameters"], dict):
+                        device["parameters"] = detail["parameters"]
                     device.update(detail)
-                    # Handle the case where the detail endpoint might return 'parameters' instead of 'parameter_json'
-                    if "parameters" in detail and "parameter_json" not in device:
-                        import json
-                        device["parameter_json"] = json.dumps(detail["parameters"])
+
+                # 2. Fetch real-time InfluxDB sensor telemetry
+                sensor_data = await api.get_latest_sensors(uid)
+                if sensor_data and isinstance(sensor_data, dict) and "sensors" in sensor_data:
+                    device["sensors"] = sensor_data.get("sensors") or {}
+                elif "sensors" not in device:
+                    device["sensors"] = {}
                 
                 result[uid] = device
 
@@ -79,7 +109,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         _LOGGER,
         name=DOMAIN,
         update_method=async_update_data,
-        update_interval=timedelta(minutes=5),
+        update_interval=timedelta(seconds=60),
     )
 
     await coordinator.async_config_entry_first_refresh()
@@ -94,9 +124,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             device_type_ids.add(dt_id)
     
     for dt_id in device_type_ids:
-        # Fetch sensor/parameter definitions
-        sensors = await api.get_sensor_definitions(dt_id)
-        parameters = await api.get_parameter_definitions(dt_id)
+        # Fetch sensor/parameter definitions with German localization
+        sensors = await api.get_sensor_definitions(dt_id, language="de")
+        parameters = await api.get_parameter_definitions(dt_id, language="de")
         definitions[dt_id] = {
             "sensors": sensors,
             "parameters": parameters,
@@ -113,6 +143,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         "coordinator": coordinator,
         "definitions": definitions,
         "device_types": device_type_data,
+        "user_level": user_level,
     }
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)

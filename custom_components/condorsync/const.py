@@ -8,6 +8,7 @@ DEFAULT_API_URL = "https://condorsync.de/api"
 CONF_DEVICE_ID = "device_id"
 CONF_ACCESS_TOKEN = "access_token"
 CONF_REFRESH_TOKEN = "refresh_token"
+CONF_USER_LEVEL = "user_level"
 
 ATTR_UNIQUE_ID = "unique_id"
 ATTR_DEVICE_TYPE = "device_type"

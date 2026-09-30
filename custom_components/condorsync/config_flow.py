@@ -20,6 +20,7 @@ from .const import (
     CONF_DEVICE_ID,
     CONF_ACCESS_TOKEN,
     CONF_REFRESH_TOKEN,
+    CONF_USER_LEVEL,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -79,6 +80,7 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         status = login_result.get("status")
 
         if status == "success":
+            user_level = api.user_level
             await api.close()
             return self.async_create_entry(
                 title=email,
@@ -89,6 +91,7 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                     CONF_DEVICE_ID: api.device_id,
                     CONF_ACCESS_TOKEN: login_result.get("access_token"),
                     CONF_REFRESH_TOKEN: login_result.get("refresh_token"),
+                    CONF_USER_LEVEL: user_level,
                 },
             )
 
@@ -136,6 +139,7 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
             if verify_result.get("status") == "success":
                 email = self._user_input[CONF_EMAIL]
+                user_level = self._api.user_level
                 entry_data = {
                     CONF_EMAIL: email,
                     CONF_PASSWORD: self._user_input[CONF_PASSWORD],
@@ -143,6 +147,7 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                     CONF_DEVICE_ID: self._api.device_id,
                     CONF_ACCESS_TOKEN: verify_result.get("access_token"),
                     CONF_REFRESH_TOKEN: verify_result.get("refresh_token"),
+                    CONF_USER_LEVEL: user_level,
                 }
                 await self._api.close()
                 return self.async_create_entry(title=email, data=entry_data)

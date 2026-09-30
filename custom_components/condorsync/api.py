@@ -40,8 +40,30 @@ class CondorSyncAPI:
         self._device_id = device_id or f"homeassistant_{uuid.uuid4().hex[:12]}"
         self._token: Optional[str] = token
         self._refresh_token: Optional[str] = refresh_token
+        self._user_level: int = 0
         self._session = session
         self._owns_session = session is None
+
+    def _update_user_level(self, user_dict: Optional[Dict[str, Any]]) -> None:
+        """Update user level based on role and permissions."""
+        if not user_dict or not isinstance(user_dict, dict):
+            return
+        role = str(user_dict.get("role", "")).lower()
+        if role in ("admin", "superadmin", "omnipotent"):
+            self._user_level = 2
+            return
+        lvl = user_dict.get("user_level")
+        if lvl is None:
+            lvl = user_dict.get("inherited_user_level", 0)
+        try:
+            self._user_level = int(lvl) if lvl is not None else 0
+        except (ValueError, TypeError):
+            self._user_level = 0
+
+    @property
+    def user_level(self) -> int:
+        """Return the user permission level (0: Normal, 1: Expert, 2: Profi)."""
+        return self._user_level
 
     @property
     def device_id(self) -> str:
@@ -72,7 +94,7 @@ class CondorSyncAPI:
             "email": self._email,
             "password": self._password,
             "device_id": self._device_id,
-            "app_version": "HomeAssistant-1.2.0",
+            "app_version": "HomeAssistant-1.2.1",
         }
         
         session = self._get_session()
@@ -92,11 +114,15 @@ class CondorSyncAPI:
 
                     self._token = data.get("access_token")
                     self._refresh_token = data.get("refresh_token")
+                    if data.get("user"):
+                        self._update_user_level(data["user"])
+
                     if self._token:
                         return {
                             "status": "success",
                             "access_token": self._token,
                             "refresh_token": self._refresh_token,
+                            "user_level": self._user_level,
                         }
                     _LOGGER.error("Auth 200 response had no access token")
                     return {"status": "invalid_auth"}
@@ -133,10 +159,14 @@ class CondorSyncAPI:
                     data = await response.json()
                     self._token = data.get("access_token")
                     self._refresh_token = data.get("refresh_token")
+                    if data.get("user"):
+                        self._update_user_level(data["user"])
+
                     return {
                         "status": "success",
                         "access_token": self._token,
                         "refresh_token": self._refresh_token,
+                        "user_level": self._user_level,
                     }
                 if response.status in (400, 401):
                     return {"status": "invalid_code"}
@@ -199,12 +229,39 @@ class CondorSyncAPI:
             return True
         return await self.authenticate()
 
-    async def get_sensor_definitions(self, device_type_id: int) -> List[Dict[str, Any]]:
+    async def get_current_user(self) -> Dict[str, Any]:
+        """Get the authenticated user's profile and synchronize permissions."""
+        if not await self._ensure_token():
+            return {}
+
+        url = f"{self._api_url}/auth/me"
+        headers = {"Authorization": f"Bearer {self._token}"}
+        session = self._get_session()
+
+        try:
+            async with session.get(url, headers=headers) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    self._update_user_level(data)
+                    return data
+                if response.status == 401 and (await self.refresh_tokens() or await self.authenticate()):
+                    headers = {"Authorization": f"Bearer {self._token}"}
+                    async with session.get(url, headers=headers) as retry_response:
+                        if retry_response.status == 200:
+                            data = await retry_response.json()
+                            self._update_user_level(data)
+                            return data
+                return {}
+        except Exception as err:
+            _LOGGER.exception("Error fetching current user profile: %s", err)
+            return {}
+
+    async def get_sensor_definitions(self, device_type_id: int, language: str = "de") -> List[Dict[str, Any]]:
         """Get sensor definitions for a device type."""
         if not await self._ensure_token():
             return []
 
-        url = f"{self._api_url}/definitions/sensors?device_type_id={device_type_id}"
+        url = f"{self._api_url}/definitions/sensors?device_type_id={device_type_id}&language={language}"
         headers = {"Authorization": f"Bearer {self._token}"}
         session = self._get_session()
 
@@ -224,12 +281,12 @@ class CondorSyncAPI:
             _LOGGER.exception("Error fetching sensor definitions: %s", err)
             return []
 
-    async def get_parameter_definitions(self, device_type_id: int) -> List[Dict[str, Any]]:
+    async def get_parameter_definitions(self, device_type_id: int, language: str = "de") -> List[Dict[str, Any]]:
         """Get parameter definitions for a device type."""
         if not await self._ensure_token():
             return []
 
-        url = f"{self._api_url}/definitions/parameters?device_type_id={device_type_id}"
+        url = f"{self._api_url}/definitions/parameters?device_type_id={device_type_id}&language={language}"
         headers = {"Authorization": f"Bearer {self._token}"}
         session = self._get_session()
 
@@ -248,6 +305,29 @@ class CondorSyncAPI:
         except Exception as err:
             _LOGGER.exception("Error fetching parameter definitions: %s", err)
             return []
+
+    async def get_latest_sensors(self, device_id: str) -> Dict[str, Any]:
+        """Get latest real-time sensor values for a device from InfluxDB."""
+        if not await self._ensure_token():
+            return {}
+
+        url = f"{self._api_url}/devices/{device_id}/sensors/latest"
+        headers = {"Authorization": f"Bearer {self._token}"}
+        session = self._get_session()
+
+        try:
+            async with session.get(url, headers=headers) as response:
+                if response.status == 200:
+                    return await response.json()
+                if response.status == 401 and (await self.refresh_tokens() or await self.authenticate()):
+                    headers = {"Authorization": f"Bearer {self._token}"}
+                    async with session.get(url, headers=headers) as retry_response:
+                        if retry_response.status == 200:
+                            return await retry_response.json()
+                return {}
+        except Exception as err:
+            _LOGGER.exception("Error fetching latest sensors for device %s: %s", device_id, err)
+            return {}
 
     async def get_devices(self) -> List[Dict[str, Any]]:
         """Get the list of devices with pagination."""

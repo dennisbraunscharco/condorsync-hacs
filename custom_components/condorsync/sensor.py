@@ -1,18 +1,138 @@
 """Sensor platform for CondorSync."""
 from __future__ import annotations
 
+import json
+import logging
+from typing import Any, Optional
+
 from homeassistant.components.sensor import (
-    SensorEntity,
     SensorDeviceClass,
+    SensorEntity,
 )
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-from typing import Any
+from .const import ATTR_DEVICE_TYPE, ATTR_LAST_SEEN, CONF_USER_LEVEL, DOMAIN
 
-from .const import DOMAIN, ATTR_DEVICE_TYPE, ATTR_LAST_SEEN
+_LOGGER = logging.getLogger(__name__)
+
+
+def _normalize_key(key: Any) -> str:
+    """Normalize a key for case-insensitive, punctuation-insensitive lookup."""
+    return str(key).strip().lower().replace("-", "_").replace(" ", "_")
+
+
+def _get_clean_display_name(definition: dict) -> str:
+    """Extract a clean, human-readable display string from definition without dict artifacts."""
+    translations = definition.get("translations") or {}
+    name_translations: dict = {}
+
+    if isinstance(translations, str):
+        try:
+            translations = json.loads(translations)
+        except Exception:
+            translations = {}
+
+    if isinstance(translations, dict):
+        raw_name = translations.get("name")
+        if isinstance(raw_name, dict):
+            name_translations = raw_name
+        elif isinstance(raw_name, str):
+            try:
+                parsed = json.loads(raw_name)
+                if isinstance(parsed, dict):
+                    name_translations = parsed
+                else:
+                    return str(parsed).strip()
+            except Exception:
+                return raw_name.strip()
+
+    # Priority: de -> en -> other languages
+    for lang in ("de", "en", "fr", "it", "es"):
+        val = name_translations.get(lang)
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+        elif isinstance(val, dict):
+            for subkey in ("title", "name", "value", "label"):
+                if isinstance(val.get(subkey), str) and val[subkey].strip():
+                    return val[subkey].strip()
+
+    for k, v in name_translations.items():
+        if isinstance(v, str) and v.strip() and not str(k).startswith("{"):
+            return v.strip()
+
+    for field in ("title", "label", "sensor_type", "name"):
+        val = definition.get(field)
+        if isinstance(val, str) and val.strip():
+            if val.strip().startswith("{") and val.strip().endswith("}"):
+                try:
+                    parsed = json.loads(val)
+                    if isinstance(parsed, dict):
+                        for sub_k in ("de", "en", "title", "name", "label"):
+                            if isinstance(parsed.get(sub_k), str) and parsed[sub_k].strip():
+                                return parsed[sub_k].strip()
+                        for sub_val in parsed.values():
+                            if isinstance(sub_val, str) and sub_val.strip():
+                                return sub_val.strip()
+                except Exception:
+                    pass
+            else:
+                return val.replace("_", " ").title()
+
+    return str(definition.get("name") or "Sensor")
+
+
+def _find_data_for_definition(device: dict, definition: dict, def_type: str) -> tuple[bool, Any]:
+    """Check if the device has data for this definition and return (found, value)."""
+    tech_name = definition.get("name")
+    if not tech_name:
+        return False, None
+    norm_target = _normalize_key(tech_name)
+
+    # 1. Check in InfluxDB sensors (device["sensors"])
+    sensors = device.get("sensors") or {}
+    if isinstance(sensors, dict):
+        for s_key, s_data in sensors.items():
+            if _normalize_key(s_key) == norm_target:
+                if isinstance(s_data, dict) and "value" in s_data:
+                    return True, s_data["value"]
+                return True, s_data
+
+    # 2. Check in device parameters (device["parameters"])
+    parameters = device.get("parameters") or {}
+    if isinstance(parameters, dict):
+        for p_key, p_val in parameters.items():
+            if _normalize_key(p_key) == norm_target:
+                return True, p_val
+
+    # Also check parameter_json if it was stored as string
+    param_json = device.get("parameter_json")
+    if param_json and isinstance(param_json, str):
+        try:
+            parsed_params = json.loads(param_json)
+            if isinstance(parsed_params, dict):
+                for p_key, p_val in parsed_params.items():
+                    if _normalize_key(p_key) == norm_target:
+                        return True, p_val
+        except Exception:
+            pass
+
+    # 3. Check in device properties (e.g. rssi, is_online, ip_address)
+    properties = device.get("properties") or {}
+    if isinstance(properties, dict):
+        for prop_key, prop_val in properties.items():
+            if _normalize_key(prop_key) == norm_target:
+                return True, prop_val
+
+    # 4. Check direct top-level device attributes
+    for dev_key, dev_val in device.items():
+        if dev_key not in ("parameters", "sensors", "properties", "parameter_json") and _normalize_key(dev_key) == norm_target:
+            return True, dev_val
+
+    return False, None
+
 
 async def async_setup_entry(
     hass: HomeAssistant,
@@ -24,25 +144,73 @@ async def async_setup_entry(
     coordinator = data["coordinator"]
     definitions = data.get("definitions", {})
     device_types = data.get("device_types", {})
+    max_user_level = data.get("user_level", config_entry.data.get(CONF_USER_LEVEL, 0))
 
-    entities = []
+    entities: list[SensorEntity] = []
+    
     for device_id, device in coordinator.data.items():
         dt_id = device.get("device_type_id")
         dt_metadata = device_types.get(dt_id, {})
         
-        # Always add the status sensor
+        # 1. Device Status Sensor (Online / Offline)
         entities.append(CondorSyncStatusSensor(coordinator, device_id, dt_metadata))
-        
-        # Add sensors and parameters from definitions
+
+        # 2. Device Signal Sensor (RSSI) if available
+        props = device.get("properties") if isinstance(device.get("properties"), dict) else {}
+        if device.get("rssi") is not None or props.get("rssi") is not None:
+            entities.append(CondorSyncSignalSensor(coordinator, device_id, dt_metadata))
+
+        # 3. Add sensors and parameters strictly matching user permission level and active data
         if dt_id and dt_id in definitions:
             device_definitions = definitions[dt_id]
-            
-            # Sensors
+            added_unique_keys: set[str] = set()
+
+            # Process InfluxDB Telemetry Sensors
             for sensor_def in device_definitions.get("sensors", []):
+                # Permission check: user_level <= max_user_level
+                def_user_level = sensor_def.get("user_level", 0)
+                try:
+                    def_user_level = int(def_user_level)
+                except (ValueError, TypeError):
+                    def_user_level = 0
+
+                if def_user_level > max_user_level:
+                    continue
+
+                # Data existence check: only create entity if device actually has data
+                has_data, _ = _find_data_for_definition(device, sensor_def, "sensor")
+                if not has_data:
+                    continue
+
+                tech_name = _normalize_key(sensor_def.get("name"))
+                if tech_name in added_unique_keys:
+                    continue
+                added_unique_keys.add(tech_name)
+
                 entities.append(CondorSyncGenericSensor(coordinator, device_id, sensor_def, "sensor", dt_metadata))
-            
-            # Parameters
+
+            # Process Parameters
             for param_def in device_definitions.get("parameters", []):
+                # Permission check: user_level <= max_user_level
+                def_user_level = param_def.get("user_level", 0)
+                try:
+                    def_user_level = int(def_user_level)
+                except (ValueError, TypeError):
+                    def_user_level = 0
+
+                if def_user_level > max_user_level:
+                    continue
+
+                # Data existence check: only create entity if device actually has data
+                has_data, _ = _find_data_for_definition(device, param_def, "parameter")
+                if not has_data:
+                    continue
+
+                tech_name = _normalize_key(param_def.get("name"))
+                if tech_name in added_unique_keys:
+                    continue
+                added_unique_keys.add(tech_name)
+
                 entities.append(CondorSyncGenericSensor(coordinator, device_id, param_def, "parameter", dt_metadata))
 
     async_add_entities(entities)
@@ -54,16 +222,16 @@ class CondorSyncStatusSensor(CoordinatorEntity, SensorEntity):
     _attr_device_class = SensorDeviceClass.ENUM
     _attr_options = ["online", "offline"]
 
-    def __init__(self, coordinator, device_id: str, dt_metadata: dict = None) -> None:
-        """Initialize the sensor."""
+    def __init__(self, coordinator, device_id: str, dt_metadata: dict | None = None) -> None:
+        """Initialize the status sensor."""
         super().__init__(coordinator)
         self._device_id = device_id
         self._dt_metadata = dt_metadata or {}
-        device = coordinator.data[device_id]
-        self._attr_name = f"{device.get('name')} Status"
+        device = coordinator.data.get(device_id) or {}
+        name = device.get("name") or device_id
+        self._attr_name = f"{name} Status"
         self._attr_unique_id = f"{device_id}_status"
-        
-        # Determine icon based on device type icon field
+
         backend_icon = (self._dt_metadata.get("icon") or "").lower()
         if "pump" in backend_icon:
             self._attr_icon = "mdi:water-pump"
@@ -76,141 +244,208 @@ class CondorSyncStatusSensor(CoordinatorEntity, SensorEntity):
 
     @property
     def native_value(self) -> str:
-        """Return the state of the sensor."""
+        """Return online or offline state."""
         device = self.coordinator.data.get(self._device_id)
-        if device and device.get("isOnline"):
-            return "online"
-        return "offline"
+        if not device:
+            return "offline"
+        props = device.get("properties") if isinstance(device.get("properties"), dict) else {}
+        is_online = (
+            device.get("is_online")
+            or props.get("is_online")
+            or device.get("isOnline")
+            or False
+        )
+        return "online" if is_online else "offline"
 
     @property
     def extra_state_attributes(self) -> dict:
-        """Return extra state attributes."""
-        device = self.coordinator.data.get(self._device_id)
-        if not device:
-            return {}
-        
+        """Return network and metadata extra state attributes."""
+        device = self.coordinator.data.get(self._device_id) or {}
+        props = device.get("properties") if isinstance(device.get("properties"), dict) else {}
         return {
-            ATTR_DEVICE_TYPE: device.get("type") or device.get("device_type"),
-            ATTR_LAST_SEEN: device.get("last_seen") or device.get("updated_at"),
+            ATTR_DEVICE_TYPE: device.get("type") or device.get("device_type") or device.get("variant"),
+            ATTR_LAST_SEEN: device.get("last_seen") or props.get("last_seen"),
+            "ip_address": props.get("ip_address") or device.get("ip_address"),
+            "mac_address": props.get("mac_address") or device.get("mac_address"),
+            "firmware_version": props.get("firmware_version0") or device.get("firmware_version0"),
+            "rssi": props.get("rssi") or device.get("rssi"),
+            "serialno": device.get("serialno") or props.get("serialno"),
         }
 
     @property
     def device_info(self) -> dict:
         """Return device information."""
-        device = self.coordinator.data.get(self._device_id)
+        device = self.coordinator.data.get(self._device_id) or {}
+        props = device.get("properties") if isinstance(device.get("properties"), dict) else {}
+        sw_version = device.get("firmware_version0") or props.get("firmware_version0")
+        model = device.get("variant") or device.get("device_type") or device.get("type")
         return {
             "identifiers": {(DOMAIN, self._device_id)},
-            "name": device.get("name"),
+            "name": device.get("name") or self._device_id,
             "manufacturer": "CondorSync",
-            "model": device.get("type"),
-            "sw_version": device.get("firmware_version0"),
+            "model": model,
+            "sw_version": sw_version,
+        }
+
+
+class CondorSyncSignalSensor(CoordinatorEntity, SensorEntity):
+    """Representation of a CondorSync device RSSI signal strength sensor."""
+
+    _attr_device_class = SensorDeviceClass.SIGNAL_STRENGTH
+    _attr_native_unit_of_measurement = "dBm"
+
+    def __init__(self, coordinator, device_id: str, dt_metadata: dict | None = None) -> None:
+        """Initialize the signal sensor."""
+        super().__init__(coordinator)
+        self._device_id = device_id
+        device = coordinator.data.get(device_id) or {}
+        name = device.get("name") or device_id
+        self._attr_name = f"{name} Signal Strength"
+        self._attr_unique_id = f"{device_id}_rssi"
+        self._attr_icon = "mdi:wifi"
+
+    @property
+    def native_value(self) -> Optional[int]:
+        """Return signal strength in dBm."""
+        device = self.coordinator.data.get(self._device_id)
+        if not device:
+            return None
+        props = device.get("properties") if isinstance(device.get("properties"), dict) else {}
+        rssi = device.get("rssi") if device.get("rssi") is not None else props.get("rssi")
+        if rssi is not None:
+            try:
+                return int(rssi)
+            except (ValueError, TypeError):
+                pass
+        return None
+
+    @property
+    def device_info(self) -> dict:
+        """Return device information."""
+        device = self.coordinator.data.get(self._device_id) or {}
+        props = device.get("properties") if isinstance(device.get("properties"), dict) else {}
+        return {
+            "identifiers": {(DOMAIN, self._device_id)},
+            "name": device.get("name") or self._device_id,
+            "manufacturer": "CondorSync",
+            "model": device.get("variant") or device.get("device_type") or device.get("type"),
+            "sw_version": device.get("firmware_version0") or props.get("firmware_version0"),
         }
 
 
 class CondorSyncGenericSensor(CoordinatorEntity, SensorEntity):
-    """Representation of a generic CondorSync sensor based on definitions."""
+    """Representation of an active CondorSync sensor or parameter."""
 
-    def __init__(self, coordinator, device_id: str, definition: dict, def_type: str, dt_metadata: dict = None) -> None:
+    def __init__(
+        self,
+        coordinator,
+        device_id: str,
+        definition: dict,
+        def_type: str,
+        dt_metadata: dict | None = None,
+    ) -> None:
         """Initialize the sensor."""
         super().__init__(coordinator)
         self._device_id = device_id
         self._definition = definition
         self._def_type = def_type
         self._dt_metadata = dt_metadata or {}
-        
-        device = coordinator.data[device_id]
-        tech_name = definition.get("name")
-        
-        # Get localized name: English -> German -> sensor_type/name (fallback)
-        translations = definition.get("translations") or {}
-        name_translations = {}
-        if isinstance(translations, dict):
-            name_translations = translations.get("name") or {}
-        elif isinstance(translations, str):
-            try:
-                import json
-                parsed = json.loads(translations)
-                name_translations = parsed.get("name") or {}
-            except (json.JSONDecodeError, TypeError):
-                pass
-                
-        display_name = (
-            name_translations.get("en") 
-            or name_translations.get("de") 
-            or definition.get("sensor_type") 
-            or tech_name
+
+        device = coordinator.data.get(device_id) or {}
+        device_name = device.get("name") or device_id
+        tech_name = definition.get("name") or "sensor"
+        clean_display_name = _get_clean_display_name(definition)
+
+        self._attr_name = f"{device_name} {clean_display_name}"
+        self._attr_unique_id = f"{device_id}_{def_type}_{_normalize_key(tech_name)}"
+        self._attr_native_unit_of_measurement = (
+            definition.get("display_unit") or definition.get("unit")
         )
-        
-        self._attr_name = f"{device.get('name')} {display_name}"
-        self._attr_unique_id = f"{device_id}_{def_type}_{tech_name}"
-        self._attr_native_unit_of_measurement = definition.get("unit")
-        
-        tech_name_lower = tech_name.lower() if tech_name else ""
-        
-        # Determine icon based on device type icon field or sensor type
-        backend_icon = self._dt_metadata.get("icon", "").lower() if self._dt_metadata.get("icon") else ""
-        if "pump" in backend_icon:
-            self._attr_icon = "mdi:water-pump"
-        elif "fan" in backend_icon:
-            self._attr_icon = "mdi:fan"
-        elif "vent" in backend_icon:
-            self._attr_icon = "mdi:air-filter"
-        elif "temp" in tech_name_lower or "temperature" in tech_name_lower:
+
+        # Set appropriate device class and icons
+        norm_tech = _normalize_key(tech_name)
+        unit = str(self._attr_native_unit_of_measurement or "").lower()
+
+        if "temp" in norm_tech or "°c" in unit or "celsius" in unit:
+            self._attr_device_class = SensorDeviceClass.TEMPERATURE
             self._attr_icon = "mdi:thermometer"
-        elif "humidity" in tech_name_lower:
+        elif "hum" in norm_tech or "%" in unit and "hum" in norm_tech:
+            self._attr_device_class = SensorDeviceClass.HUMIDITY
             self._attr_icon = "mdi:water-percent"
-        elif "battery" in tech_name_lower:
-            self._attr_icon = "mdi:battery"
-        else:
+        elif "press" in norm_tech or "bar" in unit or "mbar" in unit or "pa" in unit:
+            self._attr_device_class = SensorDeviceClass.PRESSURE
             self._attr_icon = "mdi:gauge"
-        
-        # Map data types to device classes if applicable
-        data_type = definition.get("data_type")
-        if data_type in ["number", "float", "integer"] and tech_name:
-            tech_name_lower = tech_name.lower()
-            if "temperature" in tech_name_lower:
-                self._attr_device_class = SensorDeviceClass.TEMPERATURE
-            elif "humidity" in tech_name_lower:
-                self._attr_device_class = SensorDeviceClass.HUMIDITY
-            elif "voltage" in tech_name_lower:
-                self._attr_device_class = SensorDeviceClass.VOLTAGE
-            elif "current" in tech_name_lower:
-                self._attr_device_class = SensorDeviceClass.CURRENT
-            elif "power" in tech_name_lower:
-                self._attr_device_class = SensorDeviceClass.POWER
+        elif "volt" in norm_tech or unit == "v" or unit == "mv":
+            self._attr_device_class = SensorDeviceClass.VOLTAGE
+            self._attr_icon = "mdi:lightning-bolt"
+        elif "curr" in norm_tech or unit == "a" or unit == "ma":
+            self._attr_device_class = SensorDeviceClass.CURRENT
+            self._attr_icon = "mdi:current-ac"
+        elif "power" in norm_tech or unit in ("w", "kw"):
+            self._attr_device_class = SensorDeviceClass.POWER
+            self._attr_icon = "mdi:flash"
+        elif "batt" in norm_tech:
+            self._attr_device_class = SensorDeviceClass.BATTERY
+            self._attr_icon = "mdi:battery"
+        elif "flow" in norm_tech or "l/min" in unit or "m3/h" in unit:
+            self._attr_icon = "mdi:waves-arrow-right"
+        elif "level" in norm_tech or "height" in norm_tech:
+            self._attr_icon = "mdi:ruler"
+        elif "alarm" in norm_tech:
+            self._attr_icon = "mdi:alert-circle-outline"
+        elif "pump" in norm_tech:
+            self._attr_icon = "mdi:water-pump"
+        else:
+            self._attr_icon = "mdi:tune"
 
     @property
     def native_value(self) -> Any:
-        """Return the state of the sensor."""
+        """Return the current active value from sensors or parameters."""
         device = self.coordinator.data.get(self._device_id)
         if not device:
             return None
-            
-        # Try to find the value in parameters (dict from detail API) or parameter_json (string)
-        parameters = device.get("parameters")
-        if isinstance(parameters, dict):
-            return parameters.get(self._definition.get("name"))
-            
-        import json
-        param_json_str = device.get("parameter_json")
-        if param_json_str:
+
+        has_data, value = _find_data_for_definition(device, self._definition, self._def_type)
+        if not has_data:
+            return None
+
+        # Clean numeric conversion if applicable
+        data_type = self._definition.get("data_type")
+        if data_type in ("number", "float") and value is not None:
             try:
-                params = json.loads(param_json_str) if isinstance(param_json_str, str) else param_json_str
-                return params.get(self._definition.get("name"))
-            except (json.JSONDecodeError, TypeError):
-                pass
-        
-        # Fallback to direct attribute access
-        return device.get(self._definition.get("name"))
+                decimals = self._definition.get("decimals")
+                val_float = float(value)
+                return round(val_float, int(decimals)) if decimals is not None else val_float
+            except (ValueError, TypeError):
+                return value
+        elif data_type == "integer" and value is not None:
+            try:
+                return int(value)
+            except (ValueError, TypeError):
+                return value
+
+        return value
+
+    @property
+    def extra_state_attributes(self) -> dict:
+        """Return definition details and metadata."""
+        return {
+            "definition_type": self._def_type,
+            "technical_name": self._definition.get("name"),
+            "user_level": self._definition.get("user_level", 0),
+            "category": self._definition.get("category"),
+            "data_type": self._definition.get("data_type"),
+        }
 
     @property
     def device_info(self) -> dict:
         """Return device information."""
-        device = self.coordinator.data.get(self._device_id)
+        device = self.coordinator.data.get(self._device_id) or {}
+        props = device.get("properties") if isinstance(device.get("properties"), dict) else {}
         return {
             "identifiers": {(DOMAIN, self._device_id)},
-            "name": device.get("name"),
+            "name": device.get("name") or self._device_id,
             "manufacturer": "CondorSync",
-            "model": device.get("type"),
-            "sw_version": device.get("firmware_version0"),
+            "model": device.get("variant") or device.get("device_type") or device.get("type"),
+            "sw_version": device.get("firmware_version0") or props.get("firmware_version0"),
         }

@@ -15,5 +15,5 @@
     "loggers": [
         "custom_components.condorsync"
     ],
-    "version": "1.2.0"
+    "version": "1.2.1"
 }
