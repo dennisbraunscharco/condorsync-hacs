@@ -25,4 +25,4 @@ This custom integration allows you to view your CondorSync devices in Home Assis
 2. Click **Add Integration**.
 3. Search for **CondorSync**.
 4. Enter your CondorSync email and password.
-5. (Optional) Change the API URL if you are using a custom backend.
+5. If two-factor authentication (MFA) is enabled on your account, enter your 6-digit verification code or approve the push notification on your smartphone.

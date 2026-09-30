@@ -1,0 +1,29 @@
+{
+    "config": {
+        "step": {
+            "user": {
+                "data": {
+                    "email": "E-Mail",
+                    "password": "Passwort"
+                },
+                "description": "Geben Sie Ihre CondorSync-Zugangsdaten ein."
+            },
+            "mfa": {
+                "data": {
+                    "code": "Bestätigungscode"
+                },
+                "description": "Zwei-Faktor-Authentifizierung ist für {email} erforderlich. Geben Sie den 6-stelligen Code aus Ihrer Authenticator-App ein oder bestätigen Sie die Push-Benachrichtigung auf Ihrem Smartphone."
+            }
+        },
+        "error": {
+            "invalid_auth": "Ungültige E-Mail-Adresse oder falsches Passwort",
+            "invalid_mfa_code": "Ungültiger Bestätigungscode",
+            "mfa_failed": "Zwei-Faktor-Authentifizierung fehlgeschlagen",
+            "cannot_connect": "Verbindung zur CondorSync-API fehlgeschlagen",
+            "unknown": "Unerwarteter Fehler aufgetreten"
+        },
+        "abort": {
+            "already_configured": "Konto ist bereits konfiguriert"
+        }
+    }
+}

@@ -10,7 +10,14 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from .api import CondorSyncAPI
-from .const import DOMAIN, CONF_API_URL
+from .const import (
+    DOMAIN,
+    CONF_API_URL,
+    DEFAULT_API_URL,
+    CONF_DEVICE_ID,
+    CONF_ACCESS_TOKEN,
+    CONF_REFRESH_TOKEN,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -19,9 +26,12 @@ PLATFORMS: list[Platform] = [Platform.SENSOR]
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up CondorSync from a config entry."""
     api = CondorSyncAPI(
-        entry.data[CONF_EMAIL],
-        entry.data[CONF_PASSWORD],
-        entry.data[CONF_API_URL],
+        email=entry.data[CONF_EMAIL],
+        password=entry.data[CONF_PASSWORD],
+        api_url=entry.data.get(CONF_API_URL, DEFAULT_API_URL),
+        device_id=entry.data.get(CONF_DEVICE_ID),
+        token=entry.data.get(CONF_ACCESS_TOKEN),
+        refresh_token=entry.data.get(CONF_REFRESH_TOKEN),
     )
 
     async def async_update_data():
@@ -43,7 +53,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         semaphore = asyncio.Semaphore(10)
         
         async def fetch_detail(device):
-            uid = device.get("uniqueId") or device.get("id") or device.get("device_id")
+            uid = device.get("unique_id") or device.get("uniqueId") or device.get("id") or device.get("device_id")
             if not uid:
                 return
             
