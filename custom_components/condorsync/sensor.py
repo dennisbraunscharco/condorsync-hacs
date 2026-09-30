@@ -1,4 +1,9 @@
-"""Sensor platform for CondorSync."""
+"""!
+@brief Sensor platform for CondorSync Home Assistant Integration.
+@details Discovers and provisions device status, signal strength, parameters, and telemetry sensors.
+@note Relates to REQ-HA-SYNC-001, ADR-172
+@author Dennis Braun
+"""
 from __future__ import annotations
 
 import json
@@ -20,12 +25,22 @@ _LOGGER = logging.getLogger(__name__)
 
 
 def _normalize_key(key: Any) -> str:
-    """Normalize a key for case-insensitive, punctuation-insensitive lookup."""
+    """!
+    @brief Normalize a dictionary key for case-insensitive, punctuation-insensitive lookup.
+    @param key Raw key name.
+    @return Normalized string key.
+    @author Dennis Braun
+    """
     return str(key).strip().lower().replace("-", "_").replace(" ", "_")
 
 
 def _get_clean_display_name(definition: dict) -> str:
-    """Extract a clean, human-readable display string from definition without dict artifacts."""
+    """!
+    @brief Extract a clean, human-readable display string from definition without dict artifacts.
+    @param definition Parameter or sensor definition dictionary.
+    @return Clean localized name or title.
+    @author Dennis Braun
+    """
     translations = definition.get("translations") or {}
     name_translations: dict = {}
 
@@ -85,51 +100,82 @@ def _get_clean_display_name(definition: dict) -> str:
 
 
 def _find_data_for_definition(device: dict, definition: dict, def_type: str) -> tuple[bool, Any]:
-    """Check if the device has data for this definition and return (found, value)."""
+    """!
+    @brief Check if the device has data for this definition and return (found, value).
+    @details Implements null-safe fallback across parameters, sensors, and properties.
+             Prioritizes based on def_type while ensuring valid non-None values take precedence.
+    @param device Device data dictionary from coordinator.
+    @param definition Parameter or sensor definition dictionary.
+    @param def_type Definition type ('parameter' or 'sensor').
+    @return Tuple of (found: bool, value: Any).
+    @note Relates to REQ-HA-SYNC-001, ADR-172
+    @author Dennis Braun
+    """
     tech_name = definition.get("name")
     if not tech_name:
         return False, None
     norm_target = _normalize_key(tech_name)
 
-    # 1. Check in InfluxDB sensors (device["sensors"])
-    sensors = device.get("sensors") or {}
-    if isinstance(sensors, dict):
-        for s_key, s_data in sensors.items():
-            if _normalize_key(s_key) == norm_target:
-                if isinstance(s_data, dict) and "value" in s_data:
-                    return True, s_data["value"]
-                return True, s_data
+    found_key = False
 
-    # 2. Check in device parameters (device["parameters"])
-    parameters = device.get("parameters") or {}
-    if isinstance(parameters, dict):
-        for p_key, p_val in parameters.items():
-            if _normalize_key(p_key) == norm_target:
-                return True, p_val
+    def search_sensors() -> tuple[bool, Any]:
+        sensors = device.get("sensors") or {}
+        if isinstance(sensors, dict):
+            for s_key, s_data in sensors.items():
+                if _normalize_key(s_key) == norm_target:
+                    if isinstance(s_data, dict) and "value" in s_data:
+                        return True, s_data["value"]
+                    return True, s_data
+        return False, None
 
-    # Also check parameter_json if it was stored as string
-    param_json = device.get("parameter_json")
-    if param_json and isinstance(param_json, str):
-        try:
-            parsed_params = json.loads(param_json)
-            if isinstance(parsed_params, dict):
-                for p_key, p_val in parsed_params.items():
-                    if _normalize_key(p_key) == norm_target:
-                        return True, p_val
-        except Exception:
-            pass
+    def search_parameters() -> tuple[bool, Any]:
+        parameters = device.get("parameters") or {}
+        if isinstance(parameters, dict):
+            for p_key, p_val in parameters.items():
+                if _normalize_key(p_key) == norm_target:
+                    return True, p_val
 
-    # 3. Check in device properties (e.g. rssi, is_online, ip_address)
-    properties = device.get("properties") or {}
-    if isinstance(properties, dict):
-        for prop_key, prop_val in properties.items():
-            if _normalize_key(prop_key) == norm_target:
-                return True, prop_val
+        param_json = device.get("parameter_json")
+        if param_json and isinstance(param_json, str):
+            try:
+                parsed_params = json.loads(param_json)
+                if isinstance(parsed_params, dict):
+                    for p_key, p_val in parsed_params.items():
+                        if _normalize_key(p_key) == norm_target:
+                            return True, p_val
+            except Exception:
+                pass
+        return False, None
 
-    # 4. Check direct top-level device attributes
-    for dev_key, dev_val in device.items():
-        if dev_key not in ("parameters", "sensors", "properties", "parameter_json") and _normalize_key(dev_key) == norm_target:
-            return True, dev_val
+    def search_properties() -> tuple[bool, Any]:
+        properties = device.get("properties") or {}
+        if isinstance(properties, dict):
+            for prop_key, prop_val in properties.items():
+                if _normalize_key(prop_key) == norm_target:
+                    return True, prop_val
+        return False, None
+
+    def search_top_level() -> tuple[bool, Any]:
+        for dev_key, dev_val in device.items():
+            if dev_key not in ("parameters", "sensors", "properties", "parameter_json") and _normalize_key(dev_key) == norm_target:
+                return True, dev_val
+        return False, None
+
+    # Priority order based on definition type
+    if def_type == "parameter":
+        search_functions = [search_parameters, search_sensors, search_properties, search_top_level]
+    else:
+        search_functions = [search_sensors, search_parameters, search_properties, search_top_level]
+
+    for search_fn in search_functions:
+        has_match, val = search_fn()
+        if has_match:
+            found_key = True
+            if val is not None:
+                return True, val
+
+    if found_key:
+        return True, None
 
     return False, None
 
@@ -139,7 +185,14 @@ async def async_setup_entry(
     config_entry: ConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
-    """Set up the sensor platform."""
+    """!
+    @brief Set up the sensor platform from a config entry.
+    @param hass Home Assistant instance.
+    @param config_entry Config entry being set up.
+    @param async_add_entities Callback to register new sensor entities.
+    @note Relates to REQ-HA-SYNC-001, ADR-172
+    @author Dennis Braun
+    """
     data = hass.data[DOMAIN][config_entry.entry_id]
     coordinator = data["coordinator"]
     definitions = data.get("definitions", {})
@@ -147,11 +200,11 @@ async def async_setup_entry(
     max_user_level = data.get("user_level", config_entry.data.get(CONF_USER_LEVEL, 0))
 
     entities: list[SensorEntity] = []
-    
+
     for device_id, device in coordinator.data.items():
         dt_id = device.get("device_type_id")
         dt_metadata = device_types.get(dt_id, {})
-        
+
         # 1. Device Status Sensor (Online / Offline)
         entities.append(CondorSyncStatusSensor(coordinator, device_id, dt_metadata))
 
@@ -217,13 +270,23 @@ async def async_setup_entry(
 
 
 class CondorSyncStatusSensor(CoordinatorEntity, SensorEntity):
-    """Representation of a CondorSync device status sensor."""
+    """!
+    @brief Representation of a CondorSync device status sensor.
+    @note Relates to REQ-HA-SYNC-001, ADR-172
+    @author Dennis Braun
+    """
 
     _attr_device_class = SensorDeviceClass.ENUM
     _attr_options = ["online", "offline"]
 
     def __init__(self, coordinator, device_id: str, dt_metadata: dict | None = None) -> None:
-        """Initialize the status sensor."""
+        """!
+        @brief Initialize the status sensor.
+        @param coordinator The DataUpdateCoordinator instance.
+        @param device_id Unique ID of the device.
+        @param dt_metadata Device type metadata dictionary.
+        @author Dennis Braun
+        """
         super().__init__(coordinator)
         self._device_id = device_id
         self._dt_metadata = dt_metadata or {}
@@ -244,7 +307,12 @@ class CondorSyncStatusSensor(CoordinatorEntity, SensorEntity):
 
     @property
     def native_value(self) -> str:
-        """Return online or offline state."""
+        """!
+        @brief Return online or offline state.
+        @return 'online' if device is marked online or active, 'offline' otherwise.
+        @note Relates to REQ-HA-SYNC-001, ADR-172
+        @author Dennis Braun
+        """
         device = self.coordinator.data.get(self._device_id)
         if not device:
             return "offline"
@@ -255,11 +323,17 @@ class CondorSyncStatusSensor(CoordinatorEntity, SensorEntity):
             or device.get("isOnline")
             or False
         )
+        if isinstance(is_online, (int, str)):
+            is_online = str(is_online).lower() in ("1", "true", "yes", "online")
         return "online" if is_online else "offline"
 
     @property
     def extra_state_attributes(self) -> dict:
-        """Return network and metadata extra state attributes."""
+        """!
+        @brief Return network and metadata extra state attributes.
+        @return Dictionary with device extra attributes.
+        @author Dennis Braun
+        """
         device = self.coordinator.data.get(self._device_id) or {}
         props = device.get("properties") if isinstance(device.get("properties"), dict) else {}
         return {
@@ -274,7 +348,11 @@ class CondorSyncStatusSensor(CoordinatorEntity, SensorEntity):
 
     @property
     def device_info(self) -> dict:
-        """Return device information."""
+        """!
+        @brief Return device information.
+        @return Dictionary with Home Assistant device registry data.
+        @author Dennis Braun
+        """
         device = self.coordinator.data.get(self._device_id) or {}
         props = device.get("properties") if isinstance(device.get("properties"), dict) else {}
         sw_version = device.get("firmware_version0") or props.get("firmware_version0")
@@ -289,13 +367,23 @@ class CondorSyncStatusSensor(CoordinatorEntity, SensorEntity):
 
 
 class CondorSyncSignalSensor(CoordinatorEntity, SensorEntity):
-    """Representation of a CondorSync device RSSI signal strength sensor."""
+    """!
+    @brief Representation of a CondorSync device RSSI signal strength sensor.
+    @note Relates to REQ-HA-SYNC-001, ADR-172
+    @author Dennis Braun
+    """
 
     _attr_device_class = SensorDeviceClass.SIGNAL_STRENGTH
     _attr_native_unit_of_measurement = "dBm"
 
     def __init__(self, coordinator, device_id: str, dt_metadata: dict | None = None) -> None:
-        """Initialize the signal sensor."""
+        """!
+        @brief Initialize the signal sensor.
+        @param coordinator The DataUpdateCoordinator instance.
+        @param device_id Unique ID of the device.
+        @param dt_metadata Device type metadata dictionary.
+        @author Dennis Braun
+        """
         super().__init__(coordinator)
         self._device_id = device_id
         device = coordinator.data.get(device_id) or {}
@@ -306,7 +394,11 @@ class CondorSyncSignalSensor(CoordinatorEntity, SensorEntity):
 
     @property
     def native_value(self) -> Optional[int]:
-        """Return signal strength in dBm."""
+        """!
+        @brief Return signal strength in dBm.
+        @return Integer signal strength or None.
+        @author Dennis Braun
+        """
         device = self.coordinator.data.get(self._device_id)
         if not device:
             return None
@@ -321,7 +413,11 @@ class CondorSyncSignalSensor(CoordinatorEntity, SensorEntity):
 
     @property
     def device_info(self) -> dict:
-        """Return device information."""
+        """!
+        @brief Return device information.
+        @return Dictionary with Home Assistant device registry data.
+        @author Dennis Braun
+        """
         device = self.coordinator.data.get(self._device_id) or {}
         props = device.get("properties") if isinstance(device.get("properties"), dict) else {}
         return {
@@ -334,7 +430,11 @@ class CondorSyncSignalSensor(CoordinatorEntity, SensorEntity):
 
 
 class CondorSyncGenericSensor(CoordinatorEntity, SensorEntity):
-    """Representation of an active CondorSync sensor or parameter."""
+    """!
+    @brief Representation of an active CondorSync sensor or parameter.
+    @note Relates to REQ-HA-SYNC-001, ADR-172
+    @author Dennis Braun
+    """
 
     def __init__(
         self,
@@ -344,7 +444,15 @@ class CondorSyncGenericSensor(CoordinatorEntity, SensorEntity):
         def_type: str,
         dt_metadata: dict | None = None,
     ) -> None:
-        """Initialize the sensor."""
+        """!
+        @brief Initialize the generic sensor.
+        @param coordinator The DataUpdateCoordinator instance.
+        @param device_id Unique ID of the device.
+        @param definition Parameter or sensor definition dictionary.
+        @param def_type Definition type ('parameter' or 'sensor').
+        @param dt_metadata Device type metadata dictionary.
+        @author Dennis Braun
+        """
         super().__init__(coordinator)
         self._device_id = device_id
         self._definition = definition
@@ -400,7 +508,12 @@ class CondorSyncGenericSensor(CoordinatorEntity, SensorEntity):
 
     @property
     def native_value(self) -> Any:
-        """Return the current active value from sensors or parameters."""
+        """!
+        @brief Return the current active value from sensors or parameters.
+        @return Scaled or formatted sensor value, or None if unavailable.
+        @note Relates to REQ-HA-SYNC-001, ADR-172
+        @author Dennis Braun
+        """
         device = self.coordinator.data.get(self._device_id)
         if not device:
             return None
@@ -428,7 +541,11 @@ class CondorSyncGenericSensor(CoordinatorEntity, SensorEntity):
 
     @property
     def extra_state_attributes(self) -> dict:
-        """Return definition details and metadata."""
+        """!
+        @brief Return definition details and metadata.
+        @return Dictionary containing sensor definition metadata.
+        @author Dennis Braun
+        """
         return {
             "definition_type": self._def_type,
             "technical_name": self._definition.get("name"),
@@ -439,7 +556,11 @@ class CondorSyncGenericSensor(CoordinatorEntity, SensorEntity):
 
     @property
     def device_info(self) -> dict:
-        """Return device information."""
+        """!
+        @brief Return device information.
+        @return Dictionary with Home Assistant device registry data.
+        @author Dennis Braun
+        """
         device = self.coordinator.data.get(self._device_id) or {}
         props = device.get("properties") if isinstance(device.get("properties"), dict) else {}
         return {

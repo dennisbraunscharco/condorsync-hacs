@@ -1,4 +1,9 @@
-"""Config flow for CondorSync integration."""
+"""!
+@brief Config flow for CondorSync Home Assistant integration.
+@details Implements initial user setup and MFA verification step with device binding.
+@note Relates to REQ-HA-SYNC-001, ADR-172
+@author Dennis Braun
+"""
 from __future__ import annotations
 
 import logging
@@ -25,8 +30,8 @@ from .const import (
 
 _LOGGER = logging.getLogger(__name__)
 
-# Schema strictly containing only Email and Password.
-# API URL is fixed to DEFAULT_API_URL (https://condorsync.de/api) and not editable.
+## @brief Schema strictly containing only Email and Password.
+#  @details API URL is fixed to DEFAULT_API_URL (https://condorsync.de/api) and not editable.
 STEP_USER_DATA_SCHEMA = vol.Schema(
     {
         vol.Required(CONF_EMAIL): str,
@@ -34,6 +39,7 @@ STEP_USER_DATA_SCHEMA = vol.Schema(
     }
 )
 
+## @brief Schema for MFA verification step containing the TOTP code.
 STEP_MFA_DATA_SCHEMA = vol.Schema(
     {
         vol.Required("code"): str,
@@ -42,12 +48,19 @@ STEP_MFA_DATA_SCHEMA = vol.Schema(
 
 
 class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
-    """Handle a config flow for CondorSync."""
+    """!
+    @brief Handle a config flow for CondorSync integration.
+    @note Relates to REQ-HA-SYNC-001, ADR-172
+    @author Dennis Braun
+    """
 
     VERSION = 1
 
     def __init__(self) -> None:
-        """Initialize config flow state."""
+        """!
+        @brief Initialize config flow state.
+        @author Dennis Braun
+        """
         self._user_input: dict[str, Any] = {}
         self._mfa_token_temp: str | None = None
         self._mfa_type: str | None = None
@@ -57,7 +70,13 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     async def async_step_user(
         self, user_input: dict[str, Any] | None = None
     ) -> FlowResult:
-        """Handle the initial user login step."""
+        """!
+        @brief Handle the initial user login step.
+        @param user_input Dictionary containing email and password if submitted.
+        @return FlowResult showing next step or creating entry.
+        @note Relates to REQ-HA-SYNC-001, ADR-172
+        @author Dennis Braun
+        """
         if user_input is None:
             return self.async_show_form(
                 step_id="user", data_schema=STEP_USER_DATA_SCHEMA
@@ -127,7 +146,13 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     async def async_step_mfa(
         self, user_input: dict[str, Any] | None = None
     ) -> FlowResult:
-        """Handle MFA verification code step."""
+        """!
+        @brief Handle MFA verification code step.
+        @param user_input Dictionary containing MFA code if submitted.
+        @return FlowResult creating entry or showing errors.
+        @note Relates to REQ-HA-SYNC-001, ADR-172
+        @author Dennis Braun
+        """
         errors = {}
 
         if user_input is not None and self._api and self._mfa_token_temp:
@@ -172,8 +197,14 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
 
 class InvalidAuth(HomeAssistantError):
-    """Error to indicate there is invalid auth."""
+    """!
+    @brief Error to indicate there is invalid auth.
+    @author Dennis Braun
+    """
 
 
 class CannotConnect(HomeAssistantError):
-    """Error to indicate communication failure."""
+    """!
+    @brief Error to indicate communication failure.
+    @author Dennis Braun
+    """

@@ -1,8 +1,15 @@
-"""The CondorSync integration."""
+"""!
+@brief The CondorSync integration entry point for Home Assistant.
+@details Sets up DataUpdateCoordinator, handles token persistence, and configures platforms.
+@note Relates to REQ-HA-SYNC-001, ADR-172
+@author Dennis Braun
+"""
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import timedelta
+from typing import Any, Dict
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_EMAIL, CONF_PASSWORD, Platform
@@ -24,8 +31,35 @@ _LOGGER = logging.getLogger(__name__)
 
 PLATFORMS: list[Platform] = [Platform.SENSOR]
 
+
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
-    """Set up CondorSync from a config entry."""
+    """!
+    @brief Set up CondorSync from a config entry.
+    @param hass The Home Assistant core instance.
+    @param entry The active configuration entry.
+    @return True on successful setup.
+    @note Relates to REQ-HA-SYNC-001, ADR-172
+    @author Dennis Braun
+    """
+    async def async_tokens_updated(access_token: str, refresh_token: str) -> None:
+        """!
+        @brief Persist rotated access and refresh tokens to Home Assistant config entry.
+        @param access_token New JWT access token.
+        @param refresh_token New rotating refresh token.
+        @note Relates to REQ-HA-SYNC-001, ADR-172
+        @author Dennis Braun
+        """
+        _LOGGER.debug("Persisting newly rotated tokens to Home Assistant config entry")
+        hass.config_entries.async_update_entry(
+            entry,
+            data={
+                **entry.data,
+                CONF_ACCESS_TOKEN: access_token,
+                CONF_REFRESH_TOKEN: refresh_token,
+                CONF_DEVICE_ID: api.device_id,
+            },
+        )
+
     api = CondorSyncAPI(
         email=entry.data[CONF_EMAIL],
         password=entry.data[CONF_PASSWORD],
@@ -33,7 +67,19 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         device_id=entry.data.get(CONF_DEVICE_ID),
         token=entry.data.get(CONF_ACCESS_TOKEN),
         refresh_token=entry.data.get(CONF_REFRESH_TOKEN),
+        on_tokens_updated=async_tokens_updated,
     )
+
+    # Upgrade entry data if device_id was generated dynamically or missing
+    if not entry.data.get(CONF_DEVICE_ID):
+        _LOGGER.info("Upgrading config entry with persistent device ID: %s", api.device_id)
+        hass.config_entries.async_update_entry(
+            entry,
+            data={
+                **entry.data,
+                CONF_DEVICE_ID: api.device_id,
+            },
+        )
 
     # Register static brand assets for local serving across HA versions
     try:
@@ -59,49 +105,76 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     await api.get_current_user()
     user_level = api.user_level or entry.data.get(CONF_USER_LEVEL, 0)
 
-    async def async_update_data():
-        """Fetch data from API endpoint."""
+    # Ensure coordinator reference exists for async_update_data closure
+    coordinator: DataUpdateCoordinator[dict[str, Any]] | None = None
+
+    async def async_update_data() -> dict[str, Any]:
+        """!
+        @brief Fetch data from API endpoint with resilience against transient wipeouts.
+        @return Dictionary mapping device unique IDs to complete device telemetry and parameters.
+        @throws UpdateFailed if communication with API fails or no devices could be loaded.
+        @note Relates to REQ-HA-SYNC-001, ADR-172
+        @author Dennis Braun
+        """
         devices = await api.get_devices()
-        if not devices and not await api.authenticate():
-            raise UpdateFailed("Error communicating with API")
-        
-        # We need to fetch devices again if we had to re-authenticate
         if not devices:
+            _LOGGER.warning("get_devices returned empty list, attempting re-authentication...")
+            auth_ok = await api.authenticate()
+            if not auth_ok:
+                raise UpdateFailed("Failed to authenticate with CondorSync API")
             devices = await api.get_devices()
-            
-        import asyncio
-        result = {}
-        
-        # Semaphore to avoid rate-limiting or overloading backend
+
+        if not devices:
+            # If coordinator already holds devices, never wipe them out with empty dict!
+            if coordinator is not None and coordinator.data and len(coordinator.data) > 0:
+                raise UpdateFailed(
+                    f"Received 0 devices from CondorSync API while coordinator had {len(coordinator.data)} devices."
+                )
+            # If initial setup has 0 devices, return empty dict
+            return {}
+
+        result: dict[str, Any] = {}
         semaphore = asyncio.Semaphore(10)
-        
-        async def fetch_detail(device):
+
+        async def fetch_detail(device: dict[str, Any]) -> None:
             uid = device.get("unique_id") or device.get("uniqueId") or device.get("id") or device.get("device_id")
             if not uid:
                 return
-            
+
             async with semaphore:
-                # 1. Fetch device detail (properties and parameters)
-                detail = await api.get_device_detail(uid)
-                if detail:
-                    if "properties" in detail and isinstance(detail["properties"], dict):
-                        device.update(detail["properties"])
-                    if "parameters" in detail and isinstance(detail["parameters"], dict):
-                        device["parameters"] = detail["parameters"]
-                    device.update(detail)
+                try:
+                    # 1. Fetch device detail (properties and parameters)
+                    detail = await api.get_device_detail(uid)
+                    if detail:
+                        if "properties" in detail and isinstance(detail["properties"], dict):
+                            device.update(detail["properties"])
+                        if "parameters" in detail and isinstance(detail["parameters"], dict):
+                            device["parameters"] = detail["parameters"]
+                        device.update(detail)
 
-                # 2. Fetch real-time InfluxDB sensor telemetry
-                sensor_data = await api.get_latest_sensors(uid)
-                if sensor_data and isinstance(sensor_data, dict) and "sensors" in sensor_data:
-                    device["sensors"] = sensor_data.get("sensors") or {}
-                elif "sensors" not in device:
-                    device["sensors"] = {}
-                
-                result[uid] = device
+                    # 2. Fetch real-time InfluxDB sensor telemetry
+                    sensor_data = await api.get_latest_sensors(uid)
+                    if sensor_data and isinstance(sensor_data, dict) and "sensors" in sensor_data:
+                        device["sensors"] = sensor_data.get("sensors") or {}
+                    elif "sensors" not in device:
+                        device["sensors"] = {}
 
-        if devices:
-            await asyncio.gather(*(fetch_detail(d) for d in devices))
-            
+                    result[uid] = device
+                except Exception as err:
+                    _LOGGER.error("Error fetching detail for device %s: %s", uid, err)
+                    # If detail fetch failed, but we had previous data in coordinator, preserve it
+                    if coordinator is not None and coordinator.data and uid in coordinator.data:
+                        prev = dict(coordinator.data[uid])
+                        prev.update(device)
+                        result[uid] = prev
+                    else:
+                        result[uid] = device
+
+        await asyncio.gather(*(fetch_detail(d) for d in devices))
+
+        if not result and coordinator is not None and coordinator.data:
+            raise UpdateFailed("Failed to update any device details from API")
+
         return result
 
     coordinator = DataUpdateCoordinator(
@@ -122,7 +195,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         dt_id = device.get("device_type_id")
         if dt_id:
             device_type_ids.add(dt_id)
-    
+
     for dt_id in device_type_ids:
         # Fetch sensor/parameter definitions with German localization
         sensors = await api.get_sensor_definitions(dt_id, language="de")
@@ -131,7 +204,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             "sensors": sensors,
             "parameters": parameters,
         }
-        
+
         # Fetch device type metadata (for icons)
         dt_response = await api.get_device_type(dt_id)
         if dt_response:
@@ -152,7 +225,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
-    """Unload a config entry."""
+    """!
+    @brief Unload a config entry.
+    @param hass The Home Assistant core instance.
+    @param entry The active configuration entry to unload.
+    @return True if unloading succeeded.
+    @author Dennis Braun
+    """
     if unload_ok := await hass.config_entries.async_unload_platforms(entry, PLATFORMS):
         data = hass.data[DOMAIN].pop(entry.entry_id)
         await data["api"].close()

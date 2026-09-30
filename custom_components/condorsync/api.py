@@ -1,8 +1,16 @@
-"""API Client for CondorSync."""
-import aiohttp
+"""!
+@brief API Client for CondorSync Cloud Services.
+@details Handles authentication, MFA flows, token rotation, and telemetry polling for Home Assistant.
+@note Relates to REQ-HA-SYNC-001, ADR-172
+@author Dennis Braun
+"""
+import asyncio
 import logging
+import time
 import uuid
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Coroutine, Dict, List, Optional
+
+import aiohttp
 
 from .const import DEFAULT_API_URL
 
@@ -10,7 +18,11 @@ _LOGGER = logging.getLogger(__name__)
 
 
 class CondorSyncAPI:
-    """CondorSync API Client."""
+    """!
+    @brief CondorSync API Client with concurrency locking and token persistence callbacks.
+    @note Relates to REQ-HA-SYNC-001, ADR-172
+    @author Dennis Braun
+    """
 
     def __init__(
         self,
@@ -21,11 +33,24 @@ class CondorSyncAPI:
         token: Optional[str] = None,
         refresh_token: Optional[str] = None,
         session: Optional[aiohttp.ClientSession] = None,
+        on_tokens_updated: Optional[Callable[[str, str], Coroutine[Any, Any, None]]] = None,
     ) -> None:
-        """Initialize the API client."""
+        """!
+        @brief Initialize the API client.
+        @param email User email for authentication.
+        @param password User password.
+        @param api_url Base URL of CondorSync API.
+        @param device_id Unique client device identifier for session binding.
+        @param token Initial JWT access token if known.
+        @param refresh_token Initial rotating refresh token if known.
+        @param session Optional shared aiohttp ClientSession.
+        @param on_tokens_updated Optional asynchronous callback when tokens are rotated or acquired.
+        @note Relates to REQ-HA-SYNC-001, ADR-172
+        @author Dennis Braun
+        """
         self._email = email.strip()
         self._password = password
-        
+
         # Enforce HTTPS strictly (EU CRA / NIS2 Cryptographic Communication Standard)
         normalized_url = (api_url or DEFAULT_API_URL).strip().rstrip("/")
         if normalized_url.startswith("http://"):
@@ -43,9 +68,30 @@ class CondorSyncAPI:
         self._user_level: int = 0
         self._session = session
         self._owns_session = session is None
+        self._on_tokens_updated = on_tokens_updated
+
+        # Concurrency lock and debounce timestamp to serialize single-use refresh token rotation
+        self._refresh_lock = asyncio.Lock()
+        self._last_refresh_time: float = 0.0
+
+    async def _notify_tokens_updated(self) -> None:
+        """!
+        @brief Trigger the external token update callback to persist tokens to Home Assistant storage.
+        @note Relates to REQ-HA-SYNC-001, ADR-172
+        @author Dennis Braun
+        """
+        if self._on_tokens_updated and self._token and self._refresh_token:
+            try:
+                await self._on_tokens_updated(self._token, self._refresh_token)
+            except Exception as err:
+                _LOGGER.error("Failed to execute token persistence callback: %s", err)
 
     def _update_user_level(self, user_dict: Optional[Dict[str, Any]]) -> None:
-        """Update user level based on role and permissions."""
+        """!
+        @brief Update user level based on role and permissions.
+        @param user_dict Dictionary containing user profile information from API.
+        @author Dennis Braun
+        """
         if not user_dict or not isinstance(user_dict, dict):
             return
         role = str(user_dict.get("role", "")).lower()
@@ -62,41 +108,66 @@ class CondorSyncAPI:
 
     @property
     def user_level(self) -> int:
-        """Return the user permission level (0: Normal, 1: Expert, 2: Profi)."""
+        """!
+        @brief Return the user permission level (0: Normal, 1: Expert, 2: Profi).
+        @return Integer user level.
+        @author Dennis Braun
+        """
         return self._user_level
 
     @property
     def device_id(self) -> str:
-        """Return the device ID used for session registration."""
+        """!
+        @brief Return the device ID used for session registration.
+        @return String device ID.
+        @author Dennis Braun
+        """
         return self._device_id
 
     @property
     def token(self) -> Optional[str]:
-        """Return the active access token."""
+        """!
+        @brief Return the active access token.
+        @return Access token string or None.
+        @author Dennis Braun
+        """
         return self._token
 
     @property
     def refresh_token(self) -> Optional[str]:
-        """Return the refresh token."""
+        """!
+        @brief Return the refresh token.
+        @return Refresh token string or None.
+        @author Dennis Braun
+        """
         return self._refresh_token
 
     def _get_session(self) -> aiohttp.ClientSession:
-        """Get or create the aiohttp ClientSession."""
+        """!
+        @brief Get or create the aiohttp ClientSession.
+        @return Active aiohttp ClientSession.
+        @author Dennis Braun
+        """
         if self._session is None or self._session.closed:
             self._session = aiohttp.ClientSession()
             self._owns_session = True
         return self._session
 
     async def login(self) -> dict[str, Any]:
-        """Authenticate with the CondorSync API with MFA detection."""
+        """!
+        @brief Authenticate with the CondorSync API with MFA detection.
+        @return Dictionary with auth result and status.
+        @note Relates to REQ-HA-SYNC-001, ADR-172
+        @author Dennis Braun
+        """
         url = f"{self._api_url}/auth/login"
         payload = {
             "email": self._email,
             "password": self._password,
             "device_id": self._device_id,
-            "app_version": "HomeAssistant-1.2.1",
+            "app_version": "HomeAssistant-1.2.2",
         }
-        
+
         session = self._get_session()
         try:
             async with session.post(url, json=payload) as response:
@@ -118,6 +189,8 @@ class CondorSyncAPI:
                         self._update_user_level(data["user"])
 
                     if self._token:
+                        self._last_refresh_time = time.monotonic()
+                        await self._notify_tokens_updated()
                         return {
                             "status": "success",
                             "access_token": self._token,
@@ -140,7 +213,15 @@ class CondorSyncAPI:
     async def verify_mfa(
         self, mfa_token_temp: str, code: Optional[str] = None, request_id: Optional[str] = None
     ) -> dict[str, Any]:
-        """Verify MFA challenge via TOTP code or approved push request."""
+        """!
+        @brief Verify MFA challenge via TOTP code or approved push request.
+        @param mfa_token_temp Temporary MFA verification token.
+        @param code Optional 6-digit TOTP code.
+        @param request_id Optional Push approval request ID.
+        @return Dictionary with auth result and status.
+        @note Relates to REQ-HA-SYNC-001, ADR-172
+        @author Dennis Braun
+        """
         url = f"{self._api_url}/auth/mfa/verify"
         payload: dict[str, Any] = {
             "mfa_token_temp": mfa_token_temp,
@@ -162,6 +243,9 @@ class CondorSyncAPI:
                     if data.get("user"):
                         self._update_user_level(data["user"])
 
+                    self._last_refresh_time = time.monotonic()
+                    await self._notify_tokens_updated()
+
                     return {
                         "status": "success",
                         "access_token": self._token,
@@ -176,7 +260,12 @@ class CondorSyncAPI:
             return {"status": "connection_error", "error": str(err)}
 
     async def request_mfa_push(self, mfa_token_temp: str) -> dict[str, Any]:
-        """Trigger an MFA approval push to the user's primary mobile device."""
+        """!
+        @brief Trigger an MFA approval push to the user's primary mobile device.
+        @param mfa_token_temp Temporary MFA verification token.
+        @return API response dictionary.
+        @author Dennis Braun
+        """
         url = f"{self._api_url}/auth/mfa/request-login-push"
         payload = {
             "temp_token": mfa_token_temp,
@@ -195,42 +284,69 @@ class CondorSyncAPI:
             return {"status": "connection_error", "error": str(err)}
 
     async def refresh_tokens(self) -> bool:
-        """Renew access token via refresh token rotation."""
-        if not self._refresh_token:
-            return False
+        """!
+        @brief Renew access token via single-use refresh token rotation with concurrency locking.
+        @details Serializes concurrent refresh requests and debounces duplicate executions to avoid
+                 invalidating single-use tokens on the server.
+        @return True if refresh succeeded or tokens were refreshed concurrently, False otherwise.
+        @note Relates to REQ-HA-SYNC-001, ADR-172
+        @author Dennis Braun
+        """
+        async with self._refresh_lock:
+            # Double-checked locking / debounce: if already refreshed in last 5 seconds and token exists
+            if time.monotonic() - self._last_refresh_time < 5.0 and self._token:
+                return True
 
-        url = f"{self._api_url}/auth/refresh"
-        payload = {"refresh_token": self._refresh_token}
-        session = self._get_session()
-
-        try:
-            async with session.post(url, json=payload) as response:
-                if response.status == 200:
-                    data = await response.json()
-                    self._token = data.get("access_token")
-                    self._refresh_token = data.get("refresh_token", self._refresh_token)
-                    return True
-                _LOGGER.warning("Token refresh failed with status %s", response.status)
+            if not self._refresh_token:
                 return False
-        except Exception as err:
-            _LOGGER.exception("Error refreshing access token: %s", err)
-            return False
+
+            url = f"{self._api_url}/auth/refresh"
+            payload = {"refresh_token": self._refresh_token}
+            session = self._get_session()
+
+            try:
+                async with session.post(url, json=payload) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        self._token = data.get("access_token")
+                        self._refresh_token = data.get("refresh_token", self._refresh_token)
+                        self._last_refresh_time = time.monotonic()
+                        await self._notify_tokens_updated()
+                        return True
+                    _LOGGER.warning("Token refresh failed with status %s", response.status)
+                    return False
+            except Exception as err:
+                _LOGGER.exception("Error refreshing access token: %s", err)
+                return False
 
     async def authenticate(self) -> bool:
-        """Authenticate with the CondorSync API (re-authenticate or initial)."""
+        """!
+        @brief Authenticate with the CondorSync API (re-authenticate or initial).
+        @return True if authenticated, False otherwise.
+        @note Relates to REQ-HA-SYNC-001, ADR-172
+        @author Dennis Braun
+        """
         if self._refresh_token and await self.refresh_tokens():
             return True
         login_result = await self.login()
         return login_result.get("status") == "success"
 
     async def _ensure_token(self) -> bool:
-        """Ensure a valid access token is available."""
+        """!
+        @brief Ensure a valid access token is available.
+        @return True if valid token exists or was obtained, False otherwise.
+        @author Dennis Braun
+        """
         if self._token:
             return True
         return await self.authenticate()
 
     async def get_current_user(self) -> Dict[str, Any]:
-        """Get the authenticated user's profile and synchronize permissions."""
+        """!
+        @brief Get the authenticated user's profile and synchronize permissions.
+        @return Dictionary with user profile data.
+        @author Dennis Braun
+        """
         if not await self._ensure_token():
             return {}
 
@@ -257,7 +373,13 @@ class CondorSyncAPI:
             return {}
 
     async def get_sensor_definitions(self, device_type_id: int, language: str = "de") -> List[Dict[str, Any]]:
-        """Get sensor definitions for a device type."""
+        """!
+        @brief Get sensor definitions for a device type.
+        @param device_type_id ID of the device type.
+        @param language ISO language code (default 'de').
+        @return List of sensor definition dictionaries.
+        @author Dennis Braun
+        """
         if not await self._ensure_token():
             return []
 
@@ -282,7 +404,13 @@ class CondorSyncAPI:
             return []
 
     async def get_parameter_definitions(self, device_type_id: int, language: str = "de") -> List[Dict[str, Any]]:
-        """Get parameter definitions for a device type."""
+        """!
+        @brief Get parameter definitions for a device type.
+        @param device_type_id ID of the device type.
+        @param language ISO language code (default 'de').
+        @return List of parameter definition dictionaries.
+        @author Dennis Braun
+        """
         if not await self._ensure_token():
             return []
 
@@ -307,7 +435,12 @@ class CondorSyncAPI:
             return []
 
     async def get_latest_sensors(self, device_id: str) -> Dict[str, Any]:
-        """Get latest real-time sensor values for a device from InfluxDB."""
+        """!
+        @brief Get latest real-time sensor values for a device from InfluxDB.
+        @param device_id Unique ID of the device.
+        @return Dictionary containing sensor telemetry.
+        @author Dennis Braun
+        """
         if not await self._ensure_token():
             return {}
 
@@ -330,7 +463,11 @@ class CondorSyncAPI:
             return {}
 
     async def get_devices(self) -> List[Dict[str, Any]]:
-        """Get the list of devices with pagination."""
+        """!
+        @brief Get the list of devices with pagination.
+        @return List of device dictionaries.
+        @author Dennis Braun
+        """
         if not await self._ensure_token():
             return []
 
@@ -370,7 +507,12 @@ class CondorSyncAPI:
         return all_devices
 
     async def get_device_detail(self, device_id: str) -> Dict[str, Any]:
-        """Get full device information including parameters."""
+        """!
+        @brief Get full device information including parameters and properties.
+        @param device_id Unique ID of the device.
+        @return Dictionary containing full device details.
+        @author Dennis Braun
+        """
         if not await self._ensure_token():
             return {}
 
@@ -393,7 +535,12 @@ class CondorSyncAPI:
             return {}
 
     async def get_device_type(self, device_type_id: int) -> Dict[str, Any]:
-        """Get device type definition."""
+        """!
+        @brief Get device type definition and metadata.
+        @param device_type_id ID of the device type.
+        @return Dictionary containing device type information.
+        @author Dennis Braun
+        """
         if not await self._ensure_token():
             return {}
 
@@ -416,6 +563,9 @@ class CondorSyncAPI:
             return {}
 
     async def close(self) -> None:
-        """Close the session if owned."""
+        """!
+        @brief Close the underlying HTTP session if owned by this client.
+        @author Dennis Braun
+        """
         if self._owns_session and self._session and not self._session.closed:
             await self._session.close()
