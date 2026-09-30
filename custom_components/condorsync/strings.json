@@ -8,6 +8,12 @@
                 },
                 "description": "Enter your CondorSync credentials."
             },
+            "reauth_confirm": {
+                "data": {
+                    "password": "Password"
+                },
+                "description": "Re-authenticate with your CondorSync account {email}."
+            },
             "mfa": {
                 "data": {
                     "code": "Verification Code"
@@ -23,7 +29,9 @@
             "unknown": "Unexpected error occurred"
         },
         "abort": {
-            "already_configured": "Account is already configured"
+            "already_configured": "Account is already configured",
+            "reauth_successful": "Re-authentication was successful",
+            "reauth_failed": "Re-authentication failed"
         }
     }
 }

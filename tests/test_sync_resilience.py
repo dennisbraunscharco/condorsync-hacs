@@ -15,8 +15,14 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 
 # Mock homeassistant modules if not installed in current Python env
 try:
-    import homeassistant
+    import voluptuous
 except ImportError:
+    from types import ModuleType
+    vol = ModuleType("voluptuous")
+    vol.Schema = lambda s: s
+    vol.Required = lambda k: k
+    vol.Optional = lambda k, default=None: k
+    sys.modules["voluptuous"] = vol
     from types import ModuleType
     ha = ModuleType("homeassistant")
     sys.modules["homeassistant"] = ha
@@ -39,7 +45,8 @@ except ImportError:
     class ConfigEntry:
         pass
     class ConfigFlow:
-        pass
+        def __init_subclass__(cls, domain: str = "", **kwargs):
+            pass
     ha_cfg.ConfigEntry = ConfigEntry
     ha_cfg.ConfigFlow = ConfigFlow
     sys.modules["homeassistant.config_entries"] = ha_cfg
@@ -53,7 +60,10 @@ except ImportError:
     ha_exc = ModuleType("homeassistant.exceptions")
     class HomeAssistantError(Exception):
         pass
+    class ConfigEntryAuthFailed(Exception):
+        pass
     ha_exc.HomeAssistantError = HomeAssistantError
+    ha_exc.ConfigEntryAuthFailed = ConfigEntryAuthFailed
     sys.modules["homeassistant.exceptions"] = ha_exc
 
     ha_coord = ModuleType("homeassistant.helpers.update_coordinator")
@@ -279,6 +289,36 @@ class TestTokenPersistenceAndConcurrency(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all(results))
         # Only one HTTP POST should have been dispatched due to lock and debouncing
         self.assertEqual(mock_session.post.call_count, 1)
+
+
+class TestReauthConfigFlow(unittest.IsolatedAsyncioTestCase):
+    """!
+    @brief Test suite for Home Assistant re-authentication flow.
+    @note Relates to REQ-HA-REAUTH-001, ADR-173
+    @author Dennis Braun
+    """
+
+    async def test_reauth_confirm_form_rendered(self):
+        """!
+        @brief Test that reauth step initializes entry and renders password prompt with email.
+        """
+        from custom_components.condorsync.config_flow import ConfigFlow
+        flow = ConfigFlow()
+        flow.hass = MagicMock()
+        flow.context = {"entry_id": "entry_123"}
+
+        mock_entry = MagicMock()
+        mock_entry.data = {
+            "email": "dennis@condorsync.de",
+            "password": "old_password",
+            "device_id": "ha_dev_456"
+        }
+        flow.hass.config_entries.async_get_entry.return_value = mock_entry
+        flow.async_show_form = MagicMock(return_value={"type": "form", "step_id": "reauth_confirm"})
+
+        result = await flow.async_step_reauth({})
+        self.assertEqual(flow._reauth_entry, mock_entry)
+        flow.async_show_form.assert_called_once()
 
 
 if __name__ == "__main__":

@@ -165,7 +165,7 @@ class CondorSyncAPI:
             "email": self._email,
             "password": self._password,
             "device_id": self._device_id,
-            "app_version": "HomeAssistant-1.2.2",
+            "app_version": "HomeAssistant-1.2.3",
         }
 
         session = self._get_session()

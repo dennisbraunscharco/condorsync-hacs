@@ -1,7 +1,7 @@
 """!
 @brief The CondorSync integration entry point for Home Assistant.
 @details Sets up DataUpdateCoordinator, handles token persistence, and configures platforms.
-@note Relates to REQ-HA-SYNC-001, ADR-172
+@note Relates to REQ-HA-SYNC-001, REQ-HA-REAUTH-001, ADR-172, ADR-173
 @author Dennis Braun
 """
 from __future__ import annotations
@@ -14,6 +14,7 @@ from typing import Any, Dict
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_EMAIL, CONF_PASSWORD, Platform
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import ConfigEntryAuthFailed
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from .api import CondorSyncAPI
@@ -38,7 +39,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     @param hass The Home Assistant core instance.
     @param entry The active configuration entry.
     @return True on successful setup.
-    @note Relates to REQ-HA-SYNC-001, ADR-172
+    @throws ConfigEntryAuthFailed if initial credentials fail completely.
+    @note Relates to REQ-HA-SYNC-001, REQ-HA-REAUTH-001, ADR-172, ADR-173
     @author Dennis Braun
     """
     async def async_tokens_updated(access_token: str, refresh_token: str) -> None:
@@ -102,7 +104,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         _LOGGER.debug("Could not register local brand static path: %s", brand_err)
 
     # Sync user permissions and level
-    await api.get_current_user()
+    user_info = await api.get_current_user()
+    if not user_info and not api.token:
+        auth_ok = await api.authenticate()
+        if not auth_ok:
+            raise ConfigEntryAuthFailed("Die CondorSync-Sitzung ist abgelaufen. Bitte neu authentifizieren.")
+        user_info = await api.get_current_user()
+
     user_level = api.user_level or entry.data.get(CONF_USER_LEVEL, 0)
 
     # Ensure coordinator reference exists for async_update_data closure
@@ -112,8 +120,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         """!
         @brief Fetch data from API endpoint with resilience against transient wipeouts.
         @return Dictionary mapping device unique IDs to complete device telemetry and parameters.
+        @throws ConfigEntryAuthFailed if session is invalid or revoked and reauth is required.
         @throws UpdateFailed if communication with API fails or no devices could be loaded.
-        @note Relates to REQ-HA-SYNC-001, ADR-172
+        @note Relates to REQ-HA-SYNC-001, REQ-HA-REAUTH-001, ADR-172, ADR-173
         @author Dennis Braun
         """
         devices = await api.get_devices()
@@ -121,7 +130,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             _LOGGER.warning("get_devices returned empty list, attempting re-authentication...")
             auth_ok = await api.authenticate()
             if not auth_ok:
-                raise UpdateFailed("Failed to authenticate with CondorSync API")
+                raise ConfigEntryAuthFailed("Die CondorSync-Sitzung ist abgelaufen oder erfordert eine erneute Authentifizierung.")
             devices = await api.get_devices()
 
         if not devices:

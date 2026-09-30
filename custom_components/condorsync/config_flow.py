@@ -1,13 +1,13 @@
 """!
 @brief Config flow for CondorSync Home Assistant integration.
-@details Implements initial user setup and MFA verification step with device binding.
-@note Relates to REQ-HA-SYNC-001, ADR-172
+@details Implements initial user setup, MFA verification, and the official re-authentication (reauth) flow.
+@note Relates to REQ-HA-SYNC-001, REQ-HA-REAUTH-001, ADR-172, ADR-173
 @author Dennis Braun
 """
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import Any, Mapping
 
 import voluptuous as vol
 
@@ -49,8 +49,8 @@ STEP_MFA_DATA_SCHEMA = vol.Schema(
 
 class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     """!
-    @brief Handle a config flow for CondorSync integration.
-    @note Relates to REQ-HA-SYNC-001, ADR-172
+    @brief Handle a config flow and re-authentication for CondorSync integration.
+    @note Relates to REQ-HA-SYNC-001, REQ-HA-REAUTH-001, ADR-172, ADR-173
     @author Dennis Braun
     """
 
@@ -66,6 +66,7 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         self._mfa_type: str | None = None
         self._has_trusted_device: bool = False
         self._api: CondorSyncAPI | None = None
+        self._reauth_entry: config_entries.ConfigEntry | None = None
 
     async def async_step_user(
         self, user_input: dict[str, Any] | None = None
@@ -143,14 +144,111 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             step_id="user", data_schema=STEP_USER_DATA_SCHEMA, errors=errors
         )
 
+    async def async_step_reauth(
+        self, entry_data: Mapping[str, Any]
+    ) -> FlowResult:
+        """!
+        @brief Handle initiation of re-authentication from Home Assistant.
+        @param entry_data Existing configuration entry data mapping.
+        @return FlowResult transitioning to reauth confirmation form.
+        @note Relates to REQ-HA-REAUTH-001, ADR-173
+        @author Dennis Braun
+        """
+        self._reauth_entry = self.hass.config_entries.async_get_entry(self.context["entry_id"])
+        return await self.async_step_reauth_confirm()
+
+    async def async_step_reauth_confirm(
+        self, user_input: dict[str, Any] | None = None
+    ) -> FlowResult:
+        """!
+        @brief Confirm re-authentication with password and MFA challenge.
+        @param user_input Submitted user credentials.
+        @return FlowResult continuing to MFA or completing reauth.
+        @note Relates to REQ-HA-REAUTH-001, ADR-173
+        @author Dennis Braun
+        """
+        errors = {}
+        if not self._reauth_entry:
+            return self.async_abort(reason="reauth_failed")
+
+        email = self._reauth_entry.data[CONF_EMAIL]
+
+        if user_input is None:
+            return self.async_show_form(
+                step_id="reauth_confirm",
+                data_schema=vol.Schema({
+                    vol.Required(CONF_PASSWORD): str,
+                }),
+                description_placeholders={"email": email},
+            )
+
+        password = user_input[CONF_PASSWORD]
+        api = CondorSyncAPI(
+            email=email,
+            password=password,
+            api_url=self._reauth_entry.data.get(CONF_API_URL, DEFAULT_API_URL),
+            device_id=self._reauth_entry.data.get(CONF_DEVICE_ID),
+        )
+
+        login_result = await api.login()
+        status = login_result.get("status")
+
+        if status == "success":
+            user_level = api.user_level
+            await api.close()
+            return self.async_update_reload_and_abort(
+                self._reauth_entry,
+                data={
+                    **self._reauth_entry.data,
+                    CONF_PASSWORD: password,
+                    CONF_ACCESS_TOKEN: login_result.get("access_token"),
+                    CONF_REFRESH_TOKEN: login_result.get("refresh_token"),
+                    CONF_USER_LEVEL: user_level,
+                },
+            )
+
+        if status == "mfa_required":
+            self._user_input = {CONF_EMAIL: email, CONF_PASSWORD: password}
+            self._mfa_token_temp = login_result.get("mfa_token_temp")
+            self._mfa_type = login_result.get("mfa_type", "totp")
+            self._has_trusted_device = login_result.get("has_trusted_device", False)
+            self._api = api
+
+            # Trigger push notification to smartphone if user has trusted device
+            if self._has_trusted_device and self._mfa_token_temp:
+                try:
+                    await api.request_mfa_push(self._mfa_token_temp)
+                except Exception as push_err:
+                    _LOGGER.warning("Could not send MFA push notification: %s", push_err)
+
+            return await self.async_step_mfa()
+
+        await api.close()
+
+        if status == "invalid_auth":
+            errors["base"] = "invalid_auth"
+        elif status == "connection_error":
+            errors["base"] = "cannot_connect"
+        else:
+            errors["base"] = "unknown"
+
+        return self.async_show_form(
+            step_id="reauth_confirm",
+            data_schema=vol.Schema({
+                vol.Required(CONF_PASSWORD): str,
+            }),
+            errors=errors,
+            description_placeholders={"email": email},
+        )
+
     async def async_step_mfa(
         self, user_input: dict[str, Any] | None = None
     ) -> FlowResult:
         """!
-        @brief Handle MFA verification code step.
+        @brief Handle MFA verification code step for initial setup and re-authentication.
         @param user_input Dictionary containing MFA code if submitted.
-        @return FlowResult creating entry or showing errors.
-        @note Relates to REQ-HA-SYNC-001, ADR-172
+        @return FlowResult creating entry or reloading existing entry.
+        @note Relates to REQ-HA-SYNC-001, REQ-HA-REAUTH-001, ADR-172, ADR-173
         @author Dennis Braun
         """
         errors = {}
@@ -175,6 +273,16 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                     CONF_USER_LEVEL: user_level,
                 }
                 await self._api.close()
+
+                if self._reauth_entry:
+                    return self.async_update_reload_and_abort(
+                        self._reauth_entry,
+                        data={
+                            **self._reauth_entry.data,
+                            **entry_data,
+                        },
+                    )
+
                 return self.async_create_entry(title=email, data=entry_data)
 
             if verify_result.get("status") == "invalid_code":
