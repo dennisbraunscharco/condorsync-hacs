@@ -32,8 +32,18 @@ except ImportError:
     ha_const.CONF_PASSWORD = "password"
     class Platform:
         SENSOR = "sensor"
+        BINARY_SENSOR = "binary_sensor"
     ha_const.Platform = Platform
     sys.modules["homeassistant.const"] = ha_const
+
+    ha_binary = ModuleType("homeassistant.components.binary_sensor")
+    class BinarySensorEntity:
+        pass
+    class BinarySensorDeviceClass:
+        PROBLEM = "problem"
+    ha_binary.BinarySensorEntity = BinarySensorEntity
+    ha_binary.BinarySensorDeviceClass = BinarySensorDeviceClass
+    sys.modules["homeassistant.components.binary_sensor"] = ha_binary
 
     ha_core = ModuleType("homeassistant.core")
     class HomeAssistant:
@@ -320,6 +330,142 @@ class TestReauthConfigFlow(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(flow._reauth_entry, mock_entry)
         flow.async_show_form.assert_called_once()
 
+    async def test_reauth_confirm_with_api_token(self):
+        """!
+        @brief Test that reauth step with API token entry prompts for token and updates entry.
+        @note Relates to REQ-HA-PERM-001, ADR-174
+        """
+        from custom_components.condorsync.config_flow import ConfigFlow
+        flow = ConfigFlow()
+        flow.hass = MagicMock()
+        flow.context = {"entry_id": "entry_token_123"}
+
+        mock_entry = MagicMock()
+        mock_entry.data = {
+            "email": "dennis@condorsync.de",
+            "api_token": "old_token_12345",
+        }
+        flow.hass.config_entries.async_get_entry.return_value = mock_entry
+        flow.async_show_form = MagicMock(return_value={"type": "form", "step_id": "reauth_confirm"})
+
+        await flow.async_step_reauth({})
+        self.assertEqual(flow._reauth_entry, mock_entry)
+        flow.async_show_form.assert_called_once()
+
+
+class TestPermanentTokenAuthentication(unittest.IsolatedAsyncioTestCase):
+    """!
+    @brief Test suite for permanent API token authentication in Home Assistant.
+    @note Relates to REQ-HA-PERM-001, ADR-174
+    @author Dennis Braun
+    """
+
+    async def test_permanent_token_bypasses_refresh(self):
+        """!
+        @brief Verify that permanent API tokens never execute refresh requests.
+        """
+        permanent_hex = "a" * 64
+        api = CondorSyncAPI(api_token=permanent_hex)
+        self.assertTrue(api.is_permanent)
+        self.assertEqual(api.api_token, permanent_hex)
+
+        # refresh_tokens should return True without contacting server
+        refreshed = await api.refresh_tokens()
+        self.assertTrue(refreshed)
+
+    async def test_get_permanent_token_acquisition(self):
+        """!
+        @brief Verify that get_permanent_token fetches the token and marks client permanent.
+        """
+        api = CondorSyncAPI(
+            email="dennis@condorsync.de",
+            password="secret_password",
+            token="temporary_jwt_access_token",
+        )
+        self.assertFalse(api.is_permanent)
+
+        mock_session = MagicMock()
+        mock_session.closed = False
+        mock_resp = AsyncMock()
+        mock_resp.status = 200
+        generated_token = "b" * 64
+        mock_resp.json = AsyncMock(return_value={"status": "success", "permanent_token": generated_token})
+        cm = MagicMock()
+        cm.__aenter__ = AsyncMock(return_value=mock_resp)
+        cm.__aexit__ = AsyncMock(return_value=None)
+        mock_session.get.return_value = cm
+        api._session = mock_session
+        api._owns_session = False
+
+        token = await api.get_permanent_token()
+        self.assertEqual(token, generated_token)
+        self.assertTrue(api.is_permanent)
+        self.assertEqual(api.token, generated_token)
+
+    async def test_config_flow_token_creation(self):
+        """!
+        @brief Test creating an entry via permanent API token directly.
+        """
+        from custom_components.condorsync.config_flow import ConfigFlow
+        flow = ConfigFlow()
+        flow.hass = MagicMock()
+
+        perm_hex = "c" * 64
+        mock_resp = AsyncMock()
+        mock_resp.status = 200
+        mock_resp.json = AsyncMock(return_value={
+            "id": 42,
+            "email": "dennis@condorsync.de",
+            "role": "admin",
+        })
+        cm = MagicMock()
+        cm.__aenter__ = AsyncMock(return_value=mock_resp)
+        cm.__aexit__ = AsyncMock(return_value=None)
+
+        with patch("aiohttp.ClientSession.get", return_value=cm):
+            flow.async_create_entry = MagicMock(return_value={"type": "create_entry"})
+            flow.async_set_unique_id = AsyncMock()
+            flow._abort_if_unique_id_configured = MagicMock()
+            result = await flow.async_step_token({"api_token": perm_hex})
+            flow.async_create_entry.assert_called_once()
+            call_kwargs = flow.async_create_entry.call_args[1]
+            self.assertEqual(call_kwargs["title"], "dennis@condorsync.de")
+            self.assertEqual(call_kwargs["data"]["api_token"], perm_hex)
+
+
+
+class TestProblemBinarySensor(unittest.TestCase):
+    """!
+    @brief Test suite for CondorSyncProblemBinarySensor error resolution and state.
+    @author Dennis Braun
+    """
+
+    def test_problem_sensor_is_on_when_has_error(self):
+        """!
+        @brief Verify is_on returns True when device has error or error codes.
+        """
+        from custom_components.condorsync.binary_sensor import CondorSyncProblemBinarySensor
+
+        coord = MagicMock()
+        coord.data = {
+            "dev_ok": {"has_error": False, "error_codes": []},
+            "dev_err": {"has_error": True, "error_codes": ["E101"]},
+        }
+        error_defs = [
+            {"error_code": "E101", "name": "Trockenlauf", "severity": "critical", "description": "Wasserpegel zu niedrig"}
+        ]
+
+        sensor_ok = CondorSyncProblemBinarySensor(coord, "dev_ok", error_defs)
+        self.assertFalse(sensor_ok.is_on)
+        self.assertEqual(sensor_ok.extra_state_attributes["error_count"], 0)
+
+        sensor_err = CondorSyncProblemBinarySensor(coord, "dev_err", error_defs)
+        self.assertTrue(sensor_err.is_on)
+        self.assertEqual(sensor_err.extra_state_attributes["error_count"], 1)
+        self.assertEqual(sensor_err.extra_state_attributes["active_errors"][0]["name"], "Trockenlauf")
+        self.assertEqual(sensor_err.extra_state_attributes["active_errors"][0]["severity"], "critical")
+
 
 if __name__ == "__main__":
     unittest.main()
+

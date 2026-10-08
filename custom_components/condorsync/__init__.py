@@ -26,11 +26,12 @@ from .const import (
     CONF_ACCESS_TOKEN,
     CONF_REFRESH_TOKEN,
     CONF_USER_LEVEL,
+    CONF_API_TOKEN,
 )
 
 _LOGGER = logging.getLogger(__name__)
 
-PLATFORMS: list[Platform] = [Platform.SENSOR]
+PLATFORMS: list[Platform] = [Platform.SENSOR, Platform.BINARY_SENSOR]
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
@@ -40,7 +41,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     @param entry The active configuration entry.
     @return True on successful setup.
     @throws ConfigEntryAuthFailed if initial credentials fail completely.
-    @note Relates to REQ-HA-SYNC-001, REQ-HA-REAUTH-001, ADR-172, ADR-173
+    @note Relates to REQ-HA-SYNC-001, REQ-HA-REAUTH-001, REQ-HA-PERM-001, ADR-172, ADR-173, ADR-174
     @author Dennis Braun
     """
     async def async_tokens_updated(access_token: str, refresh_token: str) -> None:
@@ -63,12 +64,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         )
 
     api = CondorSyncAPI(
-        email=entry.data[CONF_EMAIL],
-        password=entry.data[CONF_PASSWORD],
+        email=entry.data.get(CONF_EMAIL),
+        password=entry.data.get(CONF_PASSWORD),
         api_url=entry.data.get(CONF_API_URL, DEFAULT_API_URL),
         device_id=entry.data.get(CONF_DEVICE_ID),
         token=entry.data.get(CONF_ACCESS_TOKEN),
         refresh_token=entry.data.get(CONF_REFRESH_TOKEN),
+        api_token=entry.data.get(CONF_API_TOKEN),
         on_tokens_updated=async_tokens_updated,
     )
 
@@ -111,6 +113,22 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             raise ConfigEntryAuthFailed("Die CondorSync-Sitzung ist abgelaufen. Bitte neu authentifizieren.")
         user_info = await api.get_current_user()
 
+    # Proactive auto-upgrade: acquire and store permanent API token for 24/7 background stability
+    if not entry.data.get(CONF_API_TOKEN):
+        try:
+            perm_token = await api.get_permanent_token()
+            if perm_token:
+                _LOGGER.info("Upgraded CondorSync config entry to permanent API token for 24/7 background stability")
+                hass.config_entries.async_update_entry(
+                    entry,
+                    data={
+                        **entry.data,
+                        CONF_API_TOKEN: perm_token,
+                    },
+                )
+        except Exception as perm_err:
+            _LOGGER.debug("Could not auto-upgrade entry to permanent token: %s", perm_err)
+
     user_level = api.user_level or entry.data.get(CONF_USER_LEVEL, 0)
 
     # Ensure coordinator reference exists for async_update_data closure
@@ -118,20 +136,26 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     async def async_update_data() -> dict[str, Any]:
         """!
-        @brief Fetch data from API endpoint with resilience against transient wipeouts.
+        @brief Fetch data from API endpoint with resilience against transient wipeouts and spurious auth errors.
         @return Dictionary mapping device unique IDs to complete device telemetry and parameters.
         @throws ConfigEntryAuthFailed if session is invalid or revoked and reauth is required.
-        @throws UpdateFailed if communication with API fails or no devices could be loaded.
-        @note Relates to REQ-HA-SYNC-001, REQ-HA-REAUTH-001, ADR-172, ADR-173
+        @throws UpdateFailed if communication with API fails or transient network errors occur.
+        @note Relates to REQ-HA-SYNC-001, REQ-HA-REAUTH-001, REQ-HA-PERM-001, ADR-172, ADR-173, ADR-174
         @author Dennis Braun
         """
         devices = await api.get_devices()
-        if not devices:
-            _LOGGER.warning("get_devices returned empty list, attempting re-authentication...")
-            auth_ok = await api.authenticate()
-            if not auth_ok:
-                raise ConfigEntryAuthFailed("Die CondorSync-Sitzung ist abgelaufen oder erfordert eine erneute Authentifizierung.")
-            devices = await api.get_devices()
+
+        if devices is None:
+            # Network failure or 401 Unauthorized
+            if api.last_error_status == 401:
+                _LOGGER.warning("CondorSync API returned 401 Unauthorized, verifying authentication...")
+                auth_ok = await api.authenticate()
+                if not auth_ok:
+                    raise ConfigEntryAuthFailed("Die CondorSync-Sitzung ist abgelaufen oder erfordert eine erneute Authentifizierung.")
+                devices = await api.get_devices()
+
+            if devices is None:
+                raise UpdateFailed("Kommunikationsfehler beim Abrufen der CondorSync-Geräteliste.")
 
         if not devices:
             # If coordinator already holds devices, never wipe them out with empty dict!
@@ -198,6 +222,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     # Fetch definitions and device types for each device type id
     definitions = {}
+    error_definitions = {}
     device_type_data = {}
     device_type_ids = set()
     for device in coordinator.data.values():
@@ -206,13 +231,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             device_type_ids.add(dt_id)
 
     for dt_id in device_type_ids:
-        # Fetch sensor/parameter definitions with German localization
+        # Fetch sensor/parameter/error definitions with German localization
         sensors = await api.get_sensor_definitions(dt_id, language="de")
         parameters = await api.get_parameter_definitions(dt_id, language="de")
+        errors = await api.get_error_definitions(dt_id, language="de")
         definitions[dt_id] = {
             "sensors": sensors,
             "parameters": parameters,
         }
+        error_definitions[dt_id] = errors
 
         # Fetch device type metadata (for icons)
         dt_response = await api.get_device_type(dt_id)
@@ -224,6 +251,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         "api": api,
         "coordinator": coordinator,
         "definitions": definitions,
+        "error_definitions": error_definitions,
         "device_types": device_type_data,
         "user_level": user_level,
     }

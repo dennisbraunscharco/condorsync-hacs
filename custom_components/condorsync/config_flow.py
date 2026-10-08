@@ -26,12 +26,19 @@ from .const import (
     CONF_ACCESS_TOKEN,
     CONF_REFRESH_TOKEN,
     CONF_USER_LEVEL,
+    CONF_API_TOKEN,
 )
 
 _LOGGER = logging.getLogger(__name__)
 
+## @brief Schema for permanent API token entry.
+STEP_TOKEN_DATA_SCHEMA = vol.Schema(
+    {
+        vol.Required(CONF_API_TOKEN): str,
+    }
+)
+
 ## @brief Schema strictly containing only Email and Password.
-#  @details API URL is fixed to DEFAULT_API_URL (https://condorsync.de/api) and not editable.
 STEP_USER_DATA_SCHEMA = vol.Schema(
     {
         vol.Required(CONF_EMAIL): str,
@@ -50,7 +57,7 @@ STEP_MFA_DATA_SCHEMA = vol.Schema(
 class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     """!
     @brief Handle a config flow and re-authentication for CondorSync integration.
-    @note Relates to REQ-HA-SYNC-001, REQ-HA-REAUTH-001, ADR-172, ADR-173
+    @note Relates to REQ-HA-SYNC-001, REQ-HA-REAUTH-001, REQ-HA-PERM-001, ADR-172, ADR-173, ADR-174
     @author Dennis Braun
     """
 
@@ -72,15 +79,82 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         self, user_input: dict[str, Any] | None = None
     ) -> FlowResult:
         """!
-        @brief Handle the initial user login step.
-        @param user_input Dictionary containing email and password if submitted.
-        @return FlowResult showing next step or creating entry.
-        @note Relates to REQ-HA-SYNC-001, ADR-172
+        @brief Handle the initial setup step by showing auth options or dispatching direct input.
+        @param user_input Optional dictionary if submitted directly.
+        @return FlowResult showing menu options or next step.
+        @note Relates to REQ-HA-SYNC-001, REQ-HA-PERM-001, ADR-174
+        @author Dennis Braun
+        """
+        if user_input is not None:
+            if CONF_API_TOKEN in user_input:
+                return await self.async_step_token(user_input)
+            if CONF_EMAIL in user_input:
+                return await self.async_step_credentials(user_input)
+
+        return self.async_show_menu(
+            step_id="user",
+            menu_options=["token", "credentials"],
+        )
+
+    async def async_step_token(
+        self, user_input: dict[str, Any] | None = None
+    ) -> FlowResult:
+        """!
+        @brief Handle setup via permanent API token (Recommended for 24/7 Home Assistant).
+        @param user_input Dictionary containing api_token if submitted.
+        @return FlowResult showing form or creating entry.
+        @note Relates to REQ-HA-PERM-001, ADR-174
         @author Dennis Braun
         """
         if user_input is None:
             return self.async_show_form(
-                step_id="user", data_schema=STEP_USER_DATA_SCHEMA
+                step_id="token", data_schema=STEP_TOKEN_DATA_SCHEMA
+            )
+
+        errors = {}
+        api_token = user_input[CONF_API_TOKEN].strip()
+
+        api = CondorSyncAPI(
+            api_token=api_token,
+            api_url=DEFAULT_API_URL,
+        )
+
+        user_info = await api.get_current_user()
+        if user_info and user_info.get("id"):
+            email = user_info.get("email", "condorsync").strip().lower()
+            await self.async_set_unique_id(email)
+            self._abort_if_unique_id_configured()
+            user_level = api.user_level
+            await api.close()
+            return self.async_create_entry(
+                title=email,
+                data={
+                    CONF_API_TOKEN: api_token,
+                    CONF_EMAIL: email,
+                    CONF_API_URL: DEFAULT_API_URL,
+                    CONF_USER_LEVEL: user_level,
+                },
+            )
+
+        await api.close()
+        errors["base"] = "invalid_auth"
+        return self.async_show_form(
+            step_id="token", data_schema=STEP_TOKEN_DATA_SCHEMA, errors=errors
+        )
+
+    async def async_step_credentials(
+        self, user_input: dict[str, Any] | None = None
+    ) -> FlowResult:
+        """!
+        @brief Handle setup via Email and Password with automatic permanent token acquisition.
+        @param user_input Dictionary containing email and password if submitted.
+        @return FlowResult showing next step or creating entry.
+        @note Relates to REQ-HA-SYNC-001, REQ-HA-PERM-001, ADR-172, ADR-174
+        @author Dennis Braun
+        """
+        if user_input is None:
+            return self.async_show_form(
+                step_id="credentials", data_schema=STEP_USER_DATA_SCHEMA
             )
 
         errors = {}
@@ -101,18 +175,23 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
         if status == "success":
             user_level = api.user_level
+            perm_token = await api.get_permanent_token()
             await api.close()
+            entry_data = {
+                CONF_EMAIL: email,
+                CONF_PASSWORD: password,
+                CONF_API_URL: DEFAULT_API_URL,
+                CONF_DEVICE_ID: api.device_id,
+                CONF_ACCESS_TOKEN: login_result.get("access_token"),
+                CONF_REFRESH_TOKEN: login_result.get("refresh_token"),
+                CONF_USER_LEVEL: user_level,
+            }
+            if perm_token:
+                entry_data[CONF_API_TOKEN] = perm_token
+
             return self.async_create_entry(
                 title=email,
-                data={
-                    CONF_EMAIL: email,
-                    CONF_PASSWORD: password,
-                    CONF_API_URL: DEFAULT_API_URL,
-                    CONF_DEVICE_ID: api.device_id,
-                    CONF_ACCESS_TOKEN: login_result.get("access_token"),
-                    CONF_REFRESH_TOKEN: login_result.get("refresh_token"),
-                    CONF_USER_LEVEL: user_level,
-                },
+                data=entry_data,
             )
 
         if status == "mfa_required":
@@ -141,8 +220,9 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             errors["base"] = "unknown"
 
         return self.async_show_form(
-            step_id="user", data_schema=STEP_USER_DATA_SCHEMA, errors=errors
+            step_id="credentials", data_schema=STEP_USER_DATA_SCHEMA, errors=errors
         )
+
 
     async def async_step_reauth(
         self, entry_data: Mapping[str, Any]
@@ -161,17 +241,52 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         self, user_input: dict[str, Any] | None = None
     ) -> FlowResult:
         """!
-        @brief Confirm re-authentication with password and MFA challenge.
-        @param user_input Submitted user credentials.
+        @brief Confirm re-authentication with API token or password and MFA challenge.
+        @param user_input Submitted user credentials or API token.
         @return FlowResult continuing to MFA or completing reauth.
-        @note Relates to REQ-HA-REAUTH-001, ADR-173
+        @note Relates to REQ-HA-REAUTH-001, REQ-HA-PERM-001, ADR-173, ADR-174
         @author Dennis Braun
         """
         errors = {}
         if not self._reauth_entry:
             return self.async_abort(reason="reauth_failed")
 
-        email = self._reauth_entry.data[CONF_EMAIL]
+        email = self._reauth_entry.data.get(CONF_EMAIL, "CondorSync")
+
+        # If entry was configured with an API token, prompt for API token renewal
+        if self._reauth_entry.data.get(CONF_API_TOKEN):
+            if user_input is None:
+                return self.async_show_form(
+                    step_id="reauth_confirm",
+                    data_schema=STEP_TOKEN_DATA_SCHEMA,
+                    description_placeholders={"email": email},
+                )
+
+            token_val = user_input.get(CONF_API_TOKEN, "").strip()
+            api = CondorSyncAPI(
+                api_token=token_val,
+                api_url=self._reauth_entry.data.get(CONF_API_URL, DEFAULT_API_URL),
+            )
+            user_info = await api.get_current_user()
+            if user_info and user_info.get("id"):
+                user_level = api.user_level
+                await api.close()
+                return self.async_update_reload_and_abort(
+                    self._reauth_entry,
+                    data={
+                        **self._reauth_entry.data,
+                        CONF_API_TOKEN: token_val,
+                        CONF_USER_LEVEL: user_level,
+                    },
+                )
+            await api.close()
+            errors["base"] = "invalid_auth"
+            return self.async_show_form(
+                step_id="reauth_confirm",
+                data_schema=STEP_TOKEN_DATA_SCHEMA,
+                errors=errors,
+                description_placeholders={"email": email},
+            )
 
         if user_input is None:
             return self.async_show_form(
@@ -195,16 +310,21 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
         if status == "success":
             user_level = api.user_level
+            perm_token = await api.get_permanent_token()
             await api.close()
+            new_data = {
+                **self._reauth_entry.data,
+                CONF_PASSWORD: password,
+                CONF_ACCESS_TOKEN: login_result.get("access_token"),
+                CONF_REFRESH_TOKEN: login_result.get("refresh_token"),
+                CONF_USER_LEVEL: user_level,
+            }
+            if perm_token:
+                new_data[CONF_API_TOKEN] = perm_token
+
             return self.async_update_reload_and_abort(
                 self._reauth_entry,
-                data={
-                    **self._reauth_entry.data,
-                    CONF_PASSWORD: password,
-                    CONF_ACCESS_TOKEN: login_result.get("access_token"),
-                    CONF_REFRESH_TOKEN: login_result.get("refresh_token"),
-                    CONF_USER_LEVEL: user_level,
-                },
+                data=new_data,
             )
 
         if status == "mfa_required":
@@ -248,7 +368,7 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         @brief Handle MFA verification code step for initial setup and re-authentication.
         @param user_input Dictionary containing MFA code if submitted.
         @return FlowResult creating entry or reloading existing entry.
-        @note Relates to REQ-HA-SYNC-001, REQ-HA-REAUTH-001, ADR-172, ADR-173
+        @note Relates to REQ-HA-SYNC-001, REQ-HA-REAUTH-001, REQ-HA-PERM-001, ADR-172, ADR-173, ADR-174
         @author Dennis Braun
         """
         errors = {}
@@ -263,6 +383,7 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             if verify_result.get("status") == "success":
                 email = self._user_input[CONF_EMAIL]
                 user_level = self._api.user_level
+                perm_token = await self._api.get_permanent_token()
                 entry_data = {
                     CONF_EMAIL: email,
                     CONF_PASSWORD: self._user_input[CONF_PASSWORD],
@@ -272,6 +393,8 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                     CONF_REFRESH_TOKEN: verify_result.get("refresh_token"),
                     CONF_USER_LEVEL: user_level,
                 }
+                if perm_token:
+                    entry_data[CONF_API_TOKEN] = perm_token
                 await self._api.close()
 
                 if self._reauth_entry:
@@ -284,6 +407,7 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                     )
 
                 return self.async_create_entry(title=email, data=entry_data)
+
 
             if verify_result.get("status") == "invalid_code":
                 errors["base"] = "invalid_mfa_code"

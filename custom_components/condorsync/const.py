@@ -9,7 +9,9 @@ CONF_DEVICE_ID = "device_id"
 CONF_ACCESS_TOKEN = "access_token"
 CONF_REFRESH_TOKEN = "refresh_token"
 CONF_USER_LEVEL = "user_level"
+CONF_API_TOKEN = "api_token"
 
 ATTR_UNIQUE_ID = "unique_id"
 ATTR_DEVICE_TYPE = "device_type"
 ATTR_LAST_SEEN = "last_seen"
+

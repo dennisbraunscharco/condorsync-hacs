@@ -2,11 +2,34 @@
     "config": {
         "step": {
             "user": {
+                "title": "CondorSync Setup",
+                "description": "Choose your authentication method for CondorSync. For 24/7 background operation in Home Assistant, an API token is strongly recommended.",
+                "menu_options": {
+                    "token": "API Token (Permanent – Recommended)",
+                    "credentials": "User Account (Email & Password)"
+                }
+            },
+            "token": {
+                "title": "API Token Authentication",
+                "description": "Enter your personal CondorSync API token. You can find or generate it in the CondorSync App under Profile -> Settings.",
+                "data": {
+                    "api_token": "API Token"
+                }
+            },
+            "credentials": {
+                "title": "Account Login",
+                "description": "Enter your CondorSync credentials.",
                 "data": {
                     "email": "Email",
                     "password": "Password"
+                }
+            },
+            "reauth_confirm": {
+                "data": {
+                    "api_token": "API Token",
+                    "password": "Password"
                 },
-                "description": "Enter your CondorSync credentials."
+                "description": "Re-authenticate with your CondorSync account {email}."
             },
             "mfa": {
                 "data": {
@@ -16,14 +39,16 @@
             }
         },
         "error": {
-            "invalid_auth": "Invalid email or password",
+            "invalid_auth": "Invalid email, password, or API token",
             "invalid_mfa_code": "Invalid verification code",
             "mfa_failed": "Two-factor authentication failed",
             "cannot_connect": "Failed to connect to CondorSync API",
             "unknown": "Unexpected error occurred"
         },
         "abort": {
-            "already_configured": "Account is already configured"
+            "already_configured": "Account is already configured",
+            "reauth_successful": "Re-authentication was successful",
+            "reauth_failed": "Re-authentication failed"
         }
     }
 }

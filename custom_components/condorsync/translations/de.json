@@ -2,14 +2,31 @@
     "config": {
         "step": {
             "user": {
+                "title": "CondorSync Einrichtung",
+                "description": "Wählen Sie die Anmeldemethode für CondorSync. Für den unterbrechungsfreien 24/7 Dauerbetrieb in Home Assistant wird ein API-Token dringend empfohlen.",
+                "menu_options": {
+                    "token": "API-Token (Dauerhaft – Empfohlen)",
+                    "credentials": "Benutzerkonto (E-Mail & Passwort)"
+                }
+            },
+            "token": {
+                "title": "API-Token Authentifizierung",
+                "description": "Geben Sie Ihren persönlichen CondorSync API-Token ein. Sie finden bzw. erstellen diesen in der CondorSync App unter Profil -> Einstellungen.",
+                "data": {
+                    "api_token": "API-Token"
+                }
+            },
+            "credentials": {
+                "title": "Konto-Anmeldung",
+                "description": "Geben Sie Ihre CondorSync-Zugangsdaten ein.",
                 "data": {
                     "email": "E-Mail",
                     "password": "Passwort"
-                },
-                "description": "Geben Sie Ihre CondorSync-Zugangsdaten ein."
+                }
             },
             "reauth_confirm": {
                 "data": {
+                    "api_token": "API-Token",
                     "password": "Passwort"
                 },
                 "description": "Erneute Authentifizierung für CondorSync-Konto {email}."
@@ -22,7 +39,7 @@
             }
         },
         "error": {
-            "invalid_auth": "Ungültige E-Mail-Adresse oder falsches Passwort",
+            "invalid_auth": "Ungültige E-Mail-Adresse, Passwort oder API-Token",
             "invalid_mfa_code": "Ungültiger Bestätigungscode",
             "mfa_failed": "Zwei-Faktor-Authentifizierung fehlgeschlagen",
             "cannot_connect": "Verbindung zur CondorSync-API fehlgeschlagen",

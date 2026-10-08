@@ -167,11 +167,18 @@ def _find_data_for_definition(device: dict, definition: dict, def_type: str) -> 
     else:
         search_functions = [search_sensors, search_parameters, search_properties, search_top_level]
 
+    def _is_valid_value(v: Any) -> bool:
+        if v is None:
+            return False
+        if isinstance(v, str) and v.strip().lower() in ("none", "null", ""):
+            return False
+        return True
+
     for search_fn in search_functions:
         has_match, val = search_fn()
         if has_match:
             found_key = True
-            if val is not None:
+            if _is_valid_value(val):
                 return True, val
 
     if found_key:
@@ -472,39 +479,58 @@ class CondorSyncGenericSensor(CoordinatorEntity, SensorEntity):
 
         # Set appropriate device class and icons
         norm_tech = _normalize_key(tech_name)
-        unit = str(self._attr_native_unit_of_measurement or "").lower()
+        unit = str(self._attr_native_unit_of_measurement or "").lower().strip()
 
-        if "temp" in norm_tech or "°c" in unit or "celsius" in unit:
+        # Strict validation: Only assign HA device_class if unit is valid for that class
+        if unit in ("°c", "c", "°f", "f", "k") or ("temp" in norm_tech and unit in ("°c", "c", "°f", "k")):
             self._attr_device_class = SensorDeviceClass.TEMPERATURE
             self._attr_icon = "mdi:thermometer"
-        elif "hum" in norm_tech or "%" in unit and "hum" in norm_tech:
+        elif unit == "%" and "hum" in norm_tech:
             self._attr_device_class = SensorDeviceClass.HUMIDITY
             self._attr_icon = "mdi:water-percent"
-        elif "press" in norm_tech or "bar" in unit or "mbar" in unit or "pa" in unit:
+        elif unit in ("bar", "mbar", "pa", "hpa", "kpa", "psi", "inhg", "mmhg", "inh2o", "inh₂o"):
             self._attr_device_class = SensorDeviceClass.PRESSURE
             self._attr_icon = "mdi:gauge"
-        elif "volt" in norm_tech or unit == "v" or unit == "mv":
+        elif unit in ("v", "mv", "kv", "uv", "µv"):
             self._attr_device_class = SensorDeviceClass.VOLTAGE
             self._attr_icon = "mdi:lightning-bolt"
-        elif "curr" in norm_tech or unit == "a" or unit == "ma":
+        elif unit in ("a", "ma", "ka", "ua", "µa"):
             self._attr_device_class = SensorDeviceClass.CURRENT
             self._attr_icon = "mdi:current-ac"
-        elif "power" in norm_tech or unit in ("w", "kw"):
+        elif unit in ("w", "kw", "mw", "gw"):
             self._attr_device_class = SensorDeviceClass.POWER
             self._attr_icon = "mdi:flash"
-        elif "batt" in norm_tech:
+        elif unit == "%" and "batt" in norm_tech:
             self._attr_device_class = SensorDeviceClass.BATTERY
             self._attr_icon = "mdi:battery"
-        elif "flow" in norm_tech or "l/min" in unit or "m3/h" in unit:
-            self._attr_icon = "mdi:waves-arrow-right"
-        elif "level" in norm_tech or "height" in norm_tech:
-            self._attr_icon = "mdi:ruler"
-        elif "alarm" in norm_tech:
-            self._attr_icon = "mdi:alert-circle-outline"
-        elif "pump" in norm_tech:
-            self._attr_icon = "mdi:water-pump"
         else:
-            self._attr_icon = "mdi:tune"
+            self._attr_device_class = None
+            if "temp" in norm_tech:
+                self._attr_icon = "mdi:thermometer"
+            elif "press" in norm_tech or "druck" in norm_tech:
+                self._attr_icon = "mdi:gauge"
+            elif "volt" in norm_tech:
+                self._attr_icon = "mdi:lightning-bolt"
+            elif "curr" in norm_tech or "strom" in norm_tech:
+                self._attr_icon = "mdi:current-ac"
+            elif "power" in norm_tech or "leistung" in norm_tech:
+                self._attr_icon = "mdi:flash"
+            elif "batt" in norm_tech:
+                self._attr_icon = "mdi:battery"
+            elif "flow" in norm_tech or "durchfluss" in norm_tech or "l/min" in unit or "m3/h" in unit:
+                self._attr_icon = "mdi:waves-arrow-right"
+            elif "level" in norm_tech or "height" in norm_tech or "stand" in norm_tech:
+                self._attr_icon = "mdi:ruler"
+            elif "alarm" in norm_tech or "error" in norm_tech or "fehler" in norm_tech:
+                self._attr_icon = "mdi:alert-circle-outline"
+            elif "pump" in norm_tech or "pumpe" in norm_tech:
+                self._attr_icon = "mdi:water-pump"
+            elif "time" in norm_tech or "stund" in norm_tech or "hour" in norm_tech or "min" in unit or "h" in unit:
+                self._attr_icon = "mdi:clock-outline"
+            elif "freq" in norm_tech or "count" in norm_tech or "anzahl" in norm_tech:
+                self._attr_icon = "mdi:counter"
+            else:
+                self._attr_icon = "mdi:tune"
 
     @property
     def native_value(self) -> Any:
@@ -519,22 +545,39 @@ class CondorSyncGenericSensor(CoordinatorEntity, SensorEntity):
             return None
 
         has_data, value = _find_data_for_definition(device, self._definition, self._def_type)
-        if not has_data:
+        if not has_data or value is None:
+            return None
+
+        if isinstance(value, str) and value.strip().lower() in ("none", "null", ""):
             return None
 
         # Clean numeric conversion if applicable
         data_type = self._definition.get("data_type")
-        if data_type in ("number", "float") and value is not None:
+        is_numeric_sensor = (
+            self._attr_device_class in (
+                SensorDeviceClass.TEMPERATURE,
+                SensorDeviceClass.HUMIDITY,
+                SensorDeviceClass.PRESSURE,
+                SensorDeviceClass.VOLTAGE,
+                SensorDeviceClass.CURRENT,
+                SensorDeviceClass.POWER,
+                SensorDeviceClass.BATTERY,
+            )
+            or data_type in ("number", "float", "integer")
+            or self._attr_native_unit_of_measurement is not None
+        )
+
+        if is_numeric_sensor:
             try:
                 decimals = self._definition.get("decimals")
                 val_float = float(value)
+                if data_type == "integer" or (decimals is not None and int(decimals) == 0):
+                    return int(round(val_float))
                 return round(val_float, int(decimals)) if decimals is not None else val_float
             except (ValueError, TypeError):
-                return value
-        elif data_type == "integer" and value is not None:
-            try:
-                return int(value)
-            except (ValueError, TypeError):
+                # If numeric is required by HA device class but value cannot be converted, return None
+                if self._attr_device_class is not None:
+                    return None
                 return value
 
         return value

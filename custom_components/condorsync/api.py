@@ -26,30 +26,32 @@ class CondorSyncAPI:
 
     def __init__(
         self,
-        email: str,
-        password: str,
+        email: Optional[str] = None,
+        password: Optional[str] = None,
         api_url: str = DEFAULT_API_URL,
         device_id: Optional[str] = None,
         token: Optional[str] = None,
         refresh_token: Optional[str] = None,
+        api_token: Optional[str] = None,
         session: Optional[aiohttp.ClientSession] = None,
         on_tokens_updated: Optional[Callable[[str, str], Coroutine[Any, Any, None]]] = None,
     ) -> None:
         """!
         @brief Initialize the API client.
-        @param email User email for authentication.
-        @param password User password.
+        @param email Optional user email for authentication.
+        @param password Optional user password.
         @param api_url Base URL of CondorSync API.
         @param device_id Unique client device identifier for session binding.
-        @param token Initial JWT access token if known.
+        @param token Initial JWT access token or permanent token if known.
         @param refresh_token Initial rotating refresh token if known.
+        @param api_token Optional dedicated permanent API token (recommended for Home Assistant).
         @param session Optional shared aiohttp ClientSession.
         @param on_tokens_updated Optional asynchronous callback when tokens are rotated or acquired.
-        @note Relates to REQ-HA-SYNC-001, ADR-172
+        @note Relates to REQ-HA-SYNC-001, REQ-HA-PERM-001, ADR-172, ADR-174
         @author Dennis Braun
         """
-        self._email = email.strip()
-        self._password = password
+        self._email = email.strip() if email else ""
+        self._password = password or ""
 
         # Enforce HTTPS strictly (EU CRA / NIS2 Cryptographic Communication Standard)
         normalized_url = (api_url or DEFAULT_API_URL).strip().rstrip("/")
@@ -65,6 +67,21 @@ class CondorSyncAPI:
         self._device_id = device_id or f"homeassistant_{uuid.uuid4().hex[:12]}"
         self._token: Optional[str] = token
         self._refresh_token: Optional[str] = refresh_token
+        self._api_token: Optional[str] = None
+        self._is_permanent: bool = False
+        self._last_error_status: Optional[int] = None
+
+        if api_token:
+            self._api_token = api_token.strip()
+            self._token = self._api_token
+            self._is_permanent = True
+        elif token and len(token) == 64 and "." not in token:
+            # Token itself is a 64-char hex permanent token from CondorSync DB
+            self._api_token = token.strip()
+            self._token = self._api_token
+            self._is_permanent = True
+
+
         self._user_level: int = 0
         self._session = session
         self._owns_session = session is None
@@ -73,6 +90,7 @@ class CondorSyncAPI:
         # Concurrency lock and debounce timestamp to serialize single-use refresh token rotation
         self._refresh_lock = asyncio.Lock()
         self._last_refresh_time: float = 0.0
+
 
     async def _notify_tokens_updated(self) -> None:
         """!
@@ -142,6 +160,64 @@ class CondorSyncAPI:
         """
         return self._refresh_token
 
+    @property
+    def is_permanent(self) -> bool:
+        """!
+        @brief Return whether the client is authenticated with a permanent API token.
+        @return True if using permanent token, False otherwise.
+        @author Dennis Braun
+        """
+        return self._is_permanent
+
+    @property
+    def api_token(self) -> Optional[str]:
+        """!
+        @brief Return the active permanent API token if configured.
+        @return String permanent API token or None.
+        @author Dennis Braun
+        """
+        return self._api_token
+
+    @property
+    def last_error_status(self) -> Optional[int]:
+        """!
+        @brief Return the HTTP status code of the last failed request.
+        @return Integer status code or None.
+        @author Dennis Braun
+        """
+        return self._last_error_status
+
+    async def get_permanent_token(self) -> Optional[str]:
+        """!
+        @brief Retrieve or generate permanent API token from backend for the authenticated user.
+        @return String permanent API token or None.
+        @note Relates to REQ-HA-PERM-001, ADR-174
+        @author Dennis Braun
+        """
+        if self._api_token:
+            return self._api_token
+        if not await self._ensure_token():
+            return None
+
+        url = f"{self._api_url}/auth/permanent-token"
+        headers = {"Authorization": f"Bearer {self._token}"}
+        session = self._get_session()
+        try:
+            async with session.get(url, headers=headers) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    perm = data.get("permanent_token")
+                    if perm:
+                        self._api_token = perm
+                        self._token = perm
+                        self._is_permanent = True
+                    return perm
+                _LOGGER.warning("Could not fetch permanent token: status %s", response.status)
+                return None
+        except Exception as err:
+            _LOGGER.exception("Error requesting permanent token: %s", err)
+            return None
+
     def _get_session(self) -> aiohttp.ClientSession:
         """!
         @brief Get or create the aiohttp ClientSession.
@@ -157,15 +233,26 @@ class CondorSyncAPI:
         """!
         @brief Authenticate with the CondorSync API with MFA detection.
         @return Dictionary with auth result and status.
-        @note Relates to REQ-HA-SYNC-001, ADR-172
+        @note Relates to REQ-HA-SYNC-001, REQ-HA-PERM-001, ADR-172, ADR-174
         @author Dennis Braun
         """
+        if self._is_permanent:
+            user_data = await self.get_current_user()
+            if user_data and user_data.get("id"):
+                return {
+                    "status": "success",
+                    "access_token": self._token,
+                    "refresh_token": self._refresh_token,
+                    "user_level": self._user_level,
+                }
+            return {"status": "invalid_auth"}
+
         url = f"{self._api_url}/auth/login"
         payload = {
             "email": self._email,
             "password": self._password,
             "device_id": self._device_id,
-            "app_version": "HomeAssistant-1.2.3",
+            "app_version": "HomeAssistant-1.2.4",
         }
 
         session = self._get_session()
@@ -287,11 +374,14 @@ class CondorSyncAPI:
         """!
         @brief Renew access token via single-use refresh token rotation with concurrency locking.
         @details Serializes concurrent refresh requests and debounces duplicate executions to avoid
-                 invalidating single-use tokens on the server.
-        @return True if refresh succeeded or tokens were refreshed concurrently, False otherwise.
-        @note Relates to REQ-HA-SYNC-001, ADR-172
+                 invalidating single-use tokens on the server. Permanent tokens bypass refresh.
+        @return True if refresh succeeded, permanent token is active, or refreshed concurrently.
+        @note Relates to REQ-HA-SYNC-001, REQ-HA-PERM-001, ADR-172, ADR-174
         @author Dennis Braun
         """
+        if self._is_permanent:
+            return True
+
         async with self._refresh_lock:
             # Double-checked locking / debounce: if already refreshed in last 5 seconds and token exists
             if time.monotonic() - self._last_refresh_time < 5.0 and self._token:
@@ -323,9 +413,13 @@ class CondorSyncAPI:
         """!
         @brief Authenticate with the CondorSync API (re-authenticate or initial).
         @return True if authenticated, False otherwise.
-        @note Relates to REQ-HA-SYNC-001, ADR-172
+        @note Relates to REQ-HA-SYNC-001, REQ-HA-PERM-001, ADR-172, ADR-174
         @author Dennis Braun
         """
+        if self._is_permanent:
+            user_data = await self.get_current_user()
+            return bool(user_data and user_data.get("id"))
+
         if self._refresh_token and await self.refresh_tokens():
             return True
         login_result = await self.login()
@@ -360,7 +454,7 @@ class CondorSyncAPI:
                     data = await response.json()
                     self._update_user_level(data)
                     return data
-                if response.status == 401 and (await self.refresh_tokens() or await self.authenticate()):
+                if response.status == 401 and not self._is_permanent and (await self.refresh_tokens() or await self.authenticate()):
                     headers = {"Authorization": f"Bearer {self._token}"}
                     async with session.get(url, headers=headers) as retry_response:
                         if retry_response.status == 200:
@@ -392,7 +486,7 @@ class CondorSyncAPI:
                 if response.status == 200:
                     data = await response.json()
                     return data.get("data", [])
-                if response.status == 401 and await self.refresh_tokens():
+                if response.status == 401 and not self._is_permanent and await self.refresh_tokens():
                     headers = {"Authorization": f"Bearer {self._token}"}
                     async with session.get(url, headers=headers) as retry_response:
                         if retry_response.status == 200:
@@ -423,7 +517,7 @@ class CondorSyncAPI:
                 if response.status == 200:
                     data = await response.json()
                     return data.get("data", [])
-                if response.status == 401 and await self.refresh_tokens():
+                if response.status == 401 and not self._is_permanent and await self.refresh_tokens():
                     headers = {"Authorization": f"Bearer {self._token}"}
                     async with session.get(url, headers=headers) as retry_response:
                         if retry_response.status == 200:
@@ -432,6 +526,39 @@ class CondorSyncAPI:
                 return []
         except Exception as err:
             _LOGGER.exception("Error fetching parameter definitions: %s", err)
+            return []
+
+    async def get_error_definitions(self, device_type_id: Optional[int] = None, language: str = "de") -> List[Dict[str, Any]]:
+        """!
+        @brief Get error definitions for a device type or global system errors.
+        @param device_type_id Optional ID of the device type.
+        @param language ISO language code (default 'de').
+        @return List of error definition dictionaries.
+        @author Dennis Braun
+        """
+        if not await self._ensure_token():
+            return []
+
+        url = f"{self._api_url}/definitions/errors?language={language}"
+        if device_type_id is not None:
+            url += f"&device_type_id={device_type_id}"
+        headers = {"Authorization": f"Bearer {self._token}"}
+        session = self._get_session()
+
+        try:
+            async with session.get(url, headers=headers) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    return data.get("data") or data.get("definitions") or []
+                if response.status == 401 and not self._is_permanent and await self.refresh_tokens():
+                    headers = {"Authorization": f"Bearer {self._token}"}
+                    async with session.get(url, headers=headers) as retry_response:
+                        if retry_response.status == 200:
+                            data = await retry_response.json()
+                            return data.get("data") or data.get("definitions") or []
+                return []
+        except Exception as err:
+            _LOGGER.exception("Error fetching error definitions: %s", err)
             return []
 
     async def get_latest_sensors(self, device_id: str) -> Dict[str, Any]:
@@ -452,7 +579,7 @@ class CondorSyncAPI:
             async with session.get(url, headers=headers) as response:
                 if response.status == 200:
                     return await response.json()
-                if response.status == 401 and (await self.refresh_tokens() or await self.authenticate()):
+                if response.status == 401 and not self._is_permanent and (await self.refresh_tokens() or await self.authenticate()):
                     headers = {"Authorization": f"Bearer {self._token}"}
                     async with session.get(url, headers=headers) as retry_response:
                         if retry_response.status == 200:
@@ -462,15 +589,17 @@ class CondorSyncAPI:
             _LOGGER.exception("Error fetching latest sensors for device %s: %s", device_id, err)
             return {}
 
-    async def get_devices(self) -> List[Dict[str, Any]]:
+    async def get_devices(self) -> Optional[List[Dict[str, Any]]]:
         """!
         @brief Get the list of devices with pagination.
-        @return List of device dictionaries.
+        @return List of device dictionaries, or None on network/auth communication failure.
         @author Dennis Braun
         """
         if not await self._ensure_token():
-            return []
+            self._last_error_status = 401
+            return None
 
+        self._last_error_status = None
         all_devices = []
         page = 1
         page_size = 100
@@ -483,6 +612,7 @@ class CondorSyncAPI:
             try:
                 async with session.get(url, headers=headers) as response:
                     if response.status == 200:
+                        self._last_error_status = None
                         data = await response.json()
                         devices = data.get("devices", [])
                         all_devices.extend(devices)
@@ -494,17 +624,19 @@ class CondorSyncAPI:
                         page += 1
                         continue
 
-                    if response.status == 401:
+                    self._last_error_status = response.status
+                    if response.status == 401 and not self._is_permanent:
                         if await self.refresh_tokens() or await self.authenticate():
                             continue
 
                     _LOGGER.error("Failed to fetch devices at page %s: %s", page, response.status)
-                    break
+                    return None if not all_devices else all_devices
             except Exception as err:
                 _LOGGER.exception("Error fetching devices at page %s: %s", page, err)
-                break
+                return None if not all_devices else all_devices
 
         return all_devices
+
 
     async def get_device_detail(self, device_id: str) -> Dict[str, Any]:
         """!
